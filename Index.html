@@ -1,0 +1,3963 @@
+"""
+Smart Safety Helmet System
+Complete integrated codebase - All files combined into one
+"""
+
+# ============================ IMPORTS ============================
+from flask import Flask, render_template, jsonify, request, redirect, url_for, flash, Response, session
+from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity, decode_token
+from flask_cors import CORS
+from werkzeug.security import generate_password_hash, check_password_hash
+from datetime import datetime, timedelta
+import json
+import requests
+import os
+from functools import wraps
+import sqlite3
+from contextlib import closing
+
+# ============================ CONFIGURATION ============================
+class Config:
+    SECRET_KEY = os.environ.get('SECRET_KEY') or 'smart-safety-helmet-secret-key-2024'
+    SQLALCHEMY_DATABASE_URI = 'sqlite:///safety_helmet.db'
+    SQLALCHEMY_TRACK_MODIFICATIONS = False
+    JWT_SECRET_KEY = 'jwt-smart-safety-helmet-secret'
+    JWT_ACCESS_TOKEN_EXPIRES = timedelta(hours=24)
+    
+    # Risk thresholds
+    GAS_THRESHOLD = 2700
+    TEMP_THRESHOLD = 40
+    RISK_SAFE = 30
+    RISK_WARNING = 60
+    RISK_DANGER = 100
+    
+    # Telegram Bot Config
+    TELEGRAM_BOT_TOKEN = 'YOUR_BOT_TOKEN'
+    MANAGER_CHAT_ID = 'MANAGER_CHAT_ID'
+
+# ============================ DATABASE MODELS ============================
+# We'll use SQLite directly for simplicity
+def init_db():
+    """Initialize the database with required tables"""
+    conn = sqlite3.connect('safety_helmet.db')
+    c = conn.cursor()
+    
+    # Users table
+    c.execute('''CREATE TABLE IF NOT EXISTS users
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  username TEXT UNIQUE NOT NULL,
+                  password_hash TEXT NOT NULL,
+                  role TEXT NOT NULL,
+                  worker_id TEXT,
+                  telegram_id TEXT,
+                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+    
+    # Workers table
+    c.execute('''CREATE TABLE IF NOT EXISTS workers
+                 (worker_id TEXT PRIMARY KEY,
+                  name TEXT NOT NULL,
+                  helmet_id TEXT NOT NULL,
+                  department TEXT NOT NULL,
+                  phone TEXT,
+                  is_active BOOLEAN DEFAULT 0,
+                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+    
+    # Helmet logs table
+    c.execute('''CREATE TABLE IF NOT EXISTS helmet_logs
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  worker_id TEXT NOT NULL,
+                  helmet_id TEXT NOT NULL,
+                  gas INTEGER NOT NULL,
+                  temperature REAL NOT NULL,
+                  helmet_worn BOOLEAN NOT NULL,
+                  fall BOOLEAN NOT NULL,
+                  risk_score INTEGER NOT NULL,
+                  battery REAL,
+                  timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                  FOREIGN KEY (worker_id) REFERENCES workers (worker_id))''')
+    
+    # Work sessions table
+    c.execute('''CREATE TABLE IF NOT EXISTS work_sessions
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  worker_id TEXT NOT NULL,
+                  start_time TIMESTAMP NOT NULL,
+                  end_time TIMESTAMP,
+                  duration INTEGER,
+                  is_completed BOOLEAN DEFAULT 0,
+                  FOREIGN KEY (worker_id) REFERENCES workers (worker_id))''')
+    
+    # Alerts table
+    c.execute('''CREATE TABLE IF NOT EXISTS alerts
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  worker_id TEXT NOT NULL,
+                  helmet_id TEXT NOT NULL,
+                  alert_type TEXT NOT NULL,
+                  risk_score INTEGER NOT NULL,
+                  message TEXT NOT NULL,
+                  timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                  acknowledged BOOLEAN DEFAULT 0,
+                  acknowledged_by TEXT,
+                  acknowledged_at TIMESTAMP,
+                  FOREIGN KEY (worker_id) REFERENCES workers (worker_id))''')
+    
+    # Create default manager account if not exists
+    c.execute("SELECT * FROM users WHERE username = 'manager'")
+    if not c.fetchone():
+        password_hash = generate_password_hash('manager123')
+        c.execute("INSERT INTO users (username, password_hash, role, telegram_id) VALUES (?, ?, ?, ?)",
+                  ('manager', password_hash, 'manager', Config.MANAGER_CHAT_ID))
+    
+    # Create sample workers for testing
+    sample_workers = [
+        ('WKR001', 'John Smith', 'HLM001', 'Construction', '+1234567890'),
+        ('WKR002', 'Emma Wilson', 'HLM002', 'Mining', '+1234567891'),
+        ('WKR003', 'David Lee', 'HLM003', 'Manufacturing', '+1234567892'),
+        ('WKR004', 'Sarah Johnson', 'HLM004', 'Warehouse', '+1234567893'),
+        ('WKR005', 'Michael Brown', 'HLM005', 'Construction', '+1234567894'),
+    ]
+    
+    for worker in sample_workers:
+        c.execute("SELECT * FROM workers WHERE worker_id = ?", (worker[0],))
+        if not c.fetchone():
+            c.execute("INSERT INTO workers (worker_id, name, helmet_id, department, phone) VALUES (?, ?, ?, ?, ?)", worker)
+            
+            # Create worker user account
+            username = f'worker{worker[0][-3:]}'
+            password_hash = generate_password_hash('worker123')
+            c.execute("INSERT INTO users (username, password_hash, role, worker_id, telegram_id) VALUES (?, ?, ?, ?, ?)",
+                      (username, password_hash, 'worker', worker[0], f'WORKER_{worker[0]}'))
+    
+    conn.commit()
+    conn.close()
+
+# ============================ HTML TEMPLATES ============================
+# Base template
+BASE_TEMPLATE = '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Smart Safety Helmet - {% block title %}{% endblock %}</title>
+    
+    <!-- Bootstrap 5 -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    
+    <!-- Font Awesome -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    
+    <!-- Custom CSS -->
+    <style>
+        :root {
+            --primary-color: #2c3e50;
+            --secondary-color: #3498db;
+            --danger-color: #e74c3c;
+            --warning-color: #f39c12;
+            --safe-color: #2ecc71;
+            --light-bg: #f8f9fa;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #f5f7fa;
+        }
+        
+        .navbar-brand {
+            font-weight: bold;
+            color: white !important;
+        }
+        
+        .sidebar {
+            background-color: var(--primary-color);
+            min-height: 100vh;
+            color: white;
+        }
+        
+        .sidebar a {
+            color: rgba(255, 255, 255, 0.8);
+            text-decoration: none;
+            display: block;
+            padding: 10px 15px;
+            border-radius: 5px;
+            margin: 5px 0;
+            transition: all 0.3s;
+        }
+        
+        .sidebar a:hover {
+            background-color: rgba(255, 255, 255, 0.1);
+            color: white;
+        }
+        
+        .sidebar a.active {
+            background-color: var(--secondary-color);
+            color: white;
+        }
+        
+        .card {
+            border: none;
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            margin-bottom: 20px;
+            transition: transform 0.3s;
+        }
+        
+        .card:hover {
+            transform: translateY(-5px);
+        }
+        
+        .stat-card {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border-radius: 10px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+        
+        .risk-safe {
+            background-color: var(--safe-color) !important;
+            color: white;
+        }
+        
+        .risk-warning {
+            background-color: var(--warning-color) !important;
+            color: white;
+        }
+        
+        .risk-danger {
+            background-color: var(--danger-color) !important;
+            color: white;
+            animation: pulse 2s infinite;
+        }
+        
+        @keyframes pulse {
+            0% { box-shadow: 0 0 0 0 rgba(231, 76, 60, 0.4); }
+            70% { box-shadow: 0 0 0 10px rgba(231, 76, 60, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(231, 76, 60, 0); }
+        }
+        
+        .status-badge {
+            padding: 5px 15px;
+            border-radius: 20px;
+            font-weight: bold;
+            font-size: 0.9em;
+        }
+        
+        .alert-card {
+            border-left: 5px solid var(--danger-color);
+            animation: pulse 2s infinite;
+        }
+        
+        .real-time-indicator {
+            width: 15px;
+            height: 15px;
+            border-radius: 50%;
+            display: inline-block;
+            margin-right: 5px;
+            animation: blink 1s infinite;
+        }
+        
+        .online {
+            background-color: var(--safe-color);
+        }
+        
+        .offline {
+            background-color: #95a5a6;
+        }
+        
+        @keyframes blink {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        
+        /* Mobile responsive */
+        @media (max-width: 768px) {
+            .sidebar {
+                min-height: auto;
+                margin-bottom: 20px;
+            }
+            
+            .card {
+                margin-bottom: 15px;
+            }
+        }
+        
+        /* Additional styles from style.css */
+        .risk-indicator {
+            padding: 8px 20px;
+            border-radius: 20px;
+            font-weight: bold;
+            font-size: 0.9em;
+            display: inline-block;
+        }
+        
+        .status-active {
+            background: var(--safe-color);
+            color: white;
+        }
+        
+        .status-inactive {
+            background: #95a5a6;
+            color: white;
+        }
+        
+        .status-alert {
+            background: var(--danger-color);
+            color: white;
+            animation: blink 1s infinite;
+        }
+        
+        .progress {
+            height: 25px;
+            border-radius: 12px;
+            overflow: hidden;
+        }
+        
+        .progress-bar {
+            border-radius: 12px;
+            font-weight: 600;
+            line-height: 25px;
+        }
+        
+        .table th {
+            font-weight: 600;
+            color: var(--primary-color);
+            border-bottom-width: 2px;
+        }
+        
+        .table-hover tbody tr:hover {
+            background-color: rgba(52, 152, 219, 0.1);
+        }
+        
+        .btn {
+            border-radius: 8px;
+            font-weight: 600;
+            padding: 10px 20px;
+            transition: all 0.3s ease;
+        }
+        
+        .btn-primary {
+            background: linear-gradient(135deg, #3498db 0%, #2980b9 100%);
+            border: none;
+        }
+        
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.2);
+        }
+        
+        .sensor-value {
+            font-size: 2.5em;
+            font-weight: 700;
+            margin: 10px 0;
+        }
+        
+        .sensor-label {
+            color: #7f8c8d;
+            font-size: 0.9em;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        
+        .chart-container {
+            position: relative;
+            height: 300px;
+            width: 100%;
+        }
+        
+        .loading-spinner {
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid var(--secondary-color);
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 20px auto;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+    
+    <!-- Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+    <!-- Navigation -->
+    <nav class="navbar navbar-expand-lg navbar-dark" style="background-color: var(--primary-color);">
+        <div class="container-fluid">
+            <a class="navbar-brand" href="{{ url_for('dashboard') }}">
+                <i class="fas fa-hard-hat"></i> Smart Safety Helmet
+            </a>
+            
+            {% if session.get('username') %}
+            <div class="navbar-nav ms-auto">
+                <span class="navbar-text me-3">
+                    <i class="fas fa-user"></i> {{ session.username }}
+                </span>
+                <a class="btn btn-outline-light btn-sm" href="{{ url_for('logout') }}">
+                    <i class="fas fa-sign-out-alt"></i> Logout
+                </a>
+            </div>
+            {% endif %}
+        </div>
+    </nav>
+    
+    <div class="container-fluid">
+        <div class="row">
+            {% if session.get('username') %}
+            <!-- Sidebar -->
+            <div class="col-lg-2 col-md-3 sidebar p-3">
+                {% if session.role == 'worker' %}
+                <h5 class="mb-4"><i class="fas fa-user-hard-hat"></i> Worker Panel</h5>
+                <a href="{{ url_for('worker_dashboard') }}" class="{% if request.endpoint == 'worker_dashboard' %}active{% endif %}">
+                    <i class="fas fa-tachometer-alt"></i> Dashboard
+                </a>
+                <a href="{{ url_for('alerts_page') }}">
+                    <i class="fas fa-bell"></i> Alerts
+                </a>
+                <a href="{{ url_for('reports_page') }}">
+                    <i class="fas fa-chart-bar"></i> Reports
+                </a>
+                
+                {% elif session.role == 'manager' %}
+                <h5 class="mb-4"><i class="fas fa-user-tie"></i> Manager Panel</h5>
+                <a href="{{ url_for('manager_dashboard') }}" class="{% if request.endpoint == 'manager_dashboard' %}active{% endif %}">
+                    <i class="fas fa-tachometer-alt"></i> Dashboard
+                </a>
+                <a href="{{ url_for('alerts_page') }}">
+                    <i class="fas fa-exclamation-triangle"></i> Alerts
+                </a>
+                <a href="{{ url_for('reports_page') }}">
+                    <i class="fas fa-chart-bar"></i> Reports
+                </a>
+                {% endif %}
+            </div>
+            
+            <!-- Main Content -->
+            <div class="col-lg-10 col-md-9 p-4">
+                {% with messages = get_flashed_messages(with_categories=true) %}
+                    {% if messages %}
+                        {% for category, message in messages %}
+                            <div class="alert alert-{{ 'danger' if category == 'error' else 'success' }} alert-dismissible fade show" role="alert">
+                                {{ message }}
+                                <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+                            </div>
+                        {% endfor %}
+                    {% endif %}
+                {% endwith %}
+                
+                {% block content %}{% endblock %}
+            </div>
+            {% else %}
+            <!-- Full width for login -->
+            <div class="col-12">
+                {% block login_content %}{% endblock %}
+            </div>
+            {% endif %}
+        </div>
+    </div>
+    
+    <!-- Bootstrap JS -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+    
+    {% block scripts %}{% endblock %}
+</body>
+</html>
+'''
+
+# Login template
+LOGIN_TEMPLATE = '''
+{% extends "base.html" %}
+
+{% block title %}Login{% endblock %}
+
+{% block login_content %}
+<div class="container">
+    <div class="row justify-content-center align-items-center min-vh-100">
+        <div class="col-md-6 col-lg-4">
+            <div class="card">
+                <div class="card-body p-5">
+                    <div class="text-center mb-4">
+                        <div class="mb-3" style="font-size: 3em; color: var(--primary-color);">
+                            <i class="fas fa-hard-hat"></i>
+                        </div>
+                        <h2>Smart Safety Helmet</h2>
+                        <p class="text-muted">Please login to continue</p>
+                    </div>
+                    
+                    <form method="POST" action="{{ url_for('login') }}">
+                        <div class="mb-3">
+                            <label for="username" class="form-label">Username</label>
+                            <div class="input-group">
+                                <span class="input-group-text">
+                                    <i class="fas fa-user"></i>
+                                </span>
+                                <input type="text" class="form-control" id="username" name="username" 
+                                       required placeholder="Enter username">
+                            </div>
+                        </div>
+                        
+                        <div class="mb-3">
+                            <label for="password" class="form-label">Password</label>
+                            <div class="input-group">
+                                <span class="input-group-text">
+                                    <i class="fas fa-lock"></i>
+                                </span>
+                                <input type="password" class="form-control" id="password" name="password" 
+                                       required placeholder="Enter password">
+                            </div>
+                        </div>
+                        
+                        <div class="d-grid gap-2">
+                            <button type="submit" class="btn btn-primary btn-lg">
+                                <i class="fas fa-sign-in-alt"></i> Login
+                            </button>
+                        </div>
+                        
+                        <div class="text-center mt-4">
+                            <small class="text-muted">
+                                <strong>Demo Credentials:</strong><br>
+                                Manager: manager / manager123<br>
+                                Worker: worker001 / worker123
+                            </small>
+                        </div>
+                    </form>
+                </div>
+            </div>
+            
+            <div class="text-center mt-4">
+                <p class="text-muted">
+                    <i class="fas fa-shield-alt"></i> Industrial Safety Monitoring System
+                </p>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+'''
+
+# Worker Dashboard template
+WORKER_DASHBOARD_TEMPLATE = '''
+{% extends "base.html" %}
+
+{% block title %}Worker Dashboard{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h2>
+        <i class="fas fa-tachometer-alt"></i> Worker Dashboard
+    </h2>
+    <div>
+        <span class="badge bg-primary fs-6">
+            <i class="fas fa-id-card"></i> {{ worker.worker_id }}
+        </span>
+    </div>
+</div>
+
+<div class="row">
+    <!-- Real-time Status -->
+    <div class="col-lg-8">
+        <div class="card">
+            <div class="card-header bg-primary text-white">
+                <h5 class="mb-0">
+                    <i class="fas fa-heartbeat"></i> Real-time Safety Status
+                    <span class="real-time-indicator online float-end"></span>
+                </h5>
+            </div>
+            <div class="card-body">
+                <div class="row text-center">
+                    <div class="col-md-3 mb-3">
+                        <div class="card {% if latest_log and latest_log.risk_score <= 30 %}risk-safe{% elif latest_log and latest_log.risk_score <= 60 %}risk-warning{% else %}risk-danger{% endif %}">
+                            <div class="card-body">
+                                <h6>Risk Level</h6>
+                                <h2 class="mt-2">
+                                    {% if latest_log %}
+                                        {% if latest_log.risk_score <= 30 %}
+                                            SAFE
+                                        {% elif latest_log.risk_score <= 60 %}
+                                            WARNING
+                                        {% else %}
+                                            DANGER
+                                        {% endif %}
+                                    {% else %}
+                                        OFFLINE
+                                    {% endif %}
+                                </h2>
+                                <small>Score: {{ latest_log.risk_score if latest_log else 0 }}</small>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="col-md-3 mb-3">
+                        <div class="card {% if latest_log and latest_log.gas <= 2700 %}bg-success{% else %}bg-danger{% endif %} text-white">
+                            <div class="card-body">
+                                <h6>Gas Level</h6>
+                                <h1 class="mt-2">{{ latest_log.gas if latest_log else 0 }}</h1>
+                                <small>PPM</small>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="col-md-3 mb-3">
+                        <div class="card {% if latest_log and latest_log.temperature <= 40 %}bg-success{% else %}bg-danger{% endif %} text-white">
+                            <div class="card-body">
+                                <h6>Temperature</h6>
+                                <h1 class="mt-2">{{ "%.1f"|format(latest_log.temperature) if latest_log else 0 }}°C</h1>
+                                <small>Ambient</small>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="col-md-3 mb-3">
+                        <div class="card {% if latest_log and latest_log.helmet_worn %}bg-success{% else %}bg-danger{% endif %} text-white">
+                            <div class="card-body">
+                                <h6>Helmet</h6>
+                                <h2 class="mt-2">
+                                    {% if latest_log and latest_log.helmet_worn %}
+                                        <i class="fas fa-check-circle"></i> ON
+                                    {% else %}
+                                        <i class="fas fa-times-circle"></i> OFF
+                                    {% endif %}
+                                </h2>
+                                <small>Status</small>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Battery & Fall Status -->
+                <div class="row mt-3">
+                    <div class="col-md-6">
+                        <div class="card">
+                            <div class="card-body">
+                                <div class="d-flex justify-content-between align-items-center">
+                                    <div>
+                                        <h6>Battery Status</h6>
+                                        <div class="progress mt-2" style="height: 20px;">
+                                            <div class="progress-bar {% if latest_log and latest_log.battery and latest_log.battery > 3.5 %}bg-success{% elif latest_log and latest_log.battery and latest_log.battery > 3.2 %}bg-warning{% else %}bg-danger{% endif %}" 
+                                                 style="width: {% if latest_log and latest_log.battery %}{{ (latest_log.battery / 4.2 * 100)|round|int }}{% else %}0{% endif %}%">
+                                                {{ "%.2f"|format(latest_log.battery) if latest_log and latest_log.battery else 0 }}V
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div class="fs-1 ms-3">
+                                        {% if latest_log and latest_log.battery and latest_log.battery > 3.5 %}
+                                            <i class="fas fa-battery-full text-success"></i>
+                                        {% elif latest_log and latest_log.battery and latest_log.battery > 3.2 %}
+                                            <i class="fas fa-battery-half text-warning"></i>
+                                        {% else %}
+                                            <i class="fas fa-battery-empty text-danger"></i>
+                                        {% endif %}
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="col-md-6">
+                        <div class="card {% if latest_log and latest_log.fall %}risk-danger{% endif %}">
+                            <div class="card-body">
+                                <div class="d-flex justify-content-between align-items-center">
+                                    <div>
+                                        <h6>Fall Detection</h6>
+                                        <h3 class="mt-2">
+                                            {% if latest_log and latest_log.fall %}
+                                                <span class="text-danger">FALL DETECTED!</span>
+                                            {% else %}
+                                                <span class="text-success">NORMAL</span>
+                                            {% endif %}
+                                        </h3>
+                                    </div>
+                                    <div class="fs-1 ms-3">
+                                        {% if latest_log and latest_log.fall %}
+                                            <i class="fas fa-exclamation-triangle text-danger"></i>
+                                        {% else %}
+                                            <i class="fas fa-walking text-success"></i>
+                                        {% endif %}
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Working Hours & Info -->
+    <div class="col-lg-4">
+        <!-- Worker Info -->
+        <div class="card mb-4">
+            <div class="card-header bg-info text-white">
+                <h5 class="mb-0">
+                    <i class="fas fa-user"></i> Worker Information
+                </h5>
+            </div>
+            <div class="card-body">
+                <div class="text-center mb-3">
+                    <div class="mb-3" style="font-size: 4em; color: var(--primary-color);">
+                        <i class="fas fa-hard-hat"></i>
+                    </div>
+                    <h4>{{ worker.name }}</h4>
+                    <p class="text-muted">{{ worker.department }}</p>
+                </div>
+                
+                <table class="table">
+                    <tr>
+                        <td><i class="fas fa-id-card"></i> Worker ID:</td>
+                        <td class="text-end"><strong>{{ worker.worker_id }}</strong></td>
+                    </tr>
+                    <tr>
+                        <td><i class="fas fa-helmet-safety"></i> Helmet ID:</td>
+                        <td class="text-end"><strong>{{ worker.helmet_id }}</strong></td>
+                    </tr>
+                    <tr>
+                        <td><i class="fas fa-clock"></i> Today's Hours:</td>
+                        <td class="text-end"><strong>{{ today_hours }} hrs</strong></td>
+                    </tr>
+                    <tr>
+                        <td><i class="fas fa-shield-alt"></i> Last Update:</td>
+                        <td class="text-end">
+                            {% if latest_log %}
+                                <small>{{ latest_log.timestamp.strftime('%H:%M:%S') }}</small>
+                            {% else %}
+                                <small>No data</small>
+                            {% endif %}
+                        </td>
+                    </tr>
+                </table>
+            </div>
+        </div>
+        
+        <!-- Quick Stats -->
+        <div class="card">
+            <div class="card-header bg-secondary text-white">
+                <h5 class="mb-0">
+                    <i class="fas fa-chart-line"></i> Today's Summary
+                </h5>
+            </div>
+            <div class="card-body">
+                <div class="row text-center">
+                    <div class="col-6 mb-3">
+                        <div class="p-3 bg-light rounded">
+                            <h6>Work Hours</h6>
+                            <h3 class="mt-2">{{ today_hours }}</h3>
+                            <small>hours</small>
+                        </div>
+                    </div>
+                    <div class="col-6 mb-3">
+                        <div class="p-3 bg-light rounded">
+                            <h6>Risk Score</h6>
+                            <h3 class="mt-2">{{ latest_log.risk_score if latest_log else 0 }}</h3>
+                            <small>current</small>
+                        </div>
+                    </div>
+                    <div class="col-6">
+                        <div class="p-3 bg-light rounded">
+                            <h6>Alerts</h6>
+                            <h3 class="mt-2">{{ recent_alerts|length }}</h3>
+                            <small>today</small>
+                        </div>
+                    </div>
+                    <div class="col-6">
+                        <div class="p-3 bg-light rounded">
+                            <h6>Helmet</h6>
+                            <h3 class="mt-2">
+                                {% if latest_log and latest_log.helmet_worn %}
+                                    <i class="fas fa-check text-success"></i>
+                                {% else %}
+                                    <i class="fas fa-times text-danger"></i>
+                                {% endif %}
+                            </h3>
+                            <small>status</small>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Recent Alerts -->
+<div class="row mt-4">
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header bg-warning text-white">
+                <h5 class="mb-0">
+                    <i class="fas fa-exclamation-triangle"></i> Recent Alerts
+                </h5>
+            </div>
+            <div class="card-body">
+                {% if recent_alerts %}
+                <div class="table-responsive">
+                    <table class="table table-hover">
+                        <thead>
+                            <tr>
+                                <th>Time</th>
+                                <th>Type</th>
+                                <th>Risk Score</th>
+                                <th>Message</th>
+                                <th>Status</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for alert in recent_alerts %}
+                            <tr class="{% if not alert.acknowledged %}table-warning{% endif %}">
+                                <td>{{ alert.timestamp.strftime('%H:%M:%S') }}</td>
+                                <td>
+                                    <span class="badge 
+                                        {% if 'gas' in alert.alert_type %}bg-danger
+                                        {% elif 'temperature' in alert.alert_type %}bg-warning
+                                        {% elif 'fall' in alert.alert_type %}bg-danger
+                                        {% elif 'helmet' in alert.alert_type %}bg-info
+                                        {% else %}bg-secondary{% endif %}">
+                                        {{ alert.alert_type }}
+                                    </span>
+                                </td>
+                                <td>
+                                    <span class="badge 
+                                        {% if alert.risk_score <= 30 %}bg-success
+                                        {% elif alert.risk_score <= 60 %}bg-warning
+                                        {% else %}bg-danger{% endif %}">
+                                        {{ alert.risk_score }}
+                                    </span>
+                                </td>
+                                <td>{{ alert.message }}</td>
+                                <td>
+                                    {% if alert.acknowledged %}
+                                        <span class="badge bg-success">Acknowledged</span>
+                                    {% else %}
+                                        <span class="badge bg-warning">Pending</span>
+                                    {% endif %}
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+                {% else %}
+                <div class="text-center py-5">
+                    <div class="mb-3" style="font-size: 3em; color: #ccc;">
+                        <i class="fas fa-check-circle"></i>
+                    </div>
+                    <h4>No Alerts Today</h4>
+                    <p class="text-muted">Your safety status is good!</p>
+                </div>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Emergency SOS Button -->
+<div class="row mt-4">
+    <div class="col-12">
+        <div class="card alert-card">
+            <div class="card-body text-center py-4">
+                <h4 class="text-danger mb-3">
+                    <i class="fas fa-sos"></i> EMERGENCY SOS
+                </h4>
+                <p class="mb-4">Press this button only in case of emergency. It will immediately alert the manager.</p>
+                <button class="btn btn-danger btn-lg" onclick="sendSOS()">
+                    <i class="fas fa-bell"></i> SEND SOS ALERT
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    // Auto-refresh dashboard every 10 seconds
+    setInterval(function() {
+        fetch('/api/worker/status')
+            .then(response => response.json())
+            .then(data => {
+                // Update UI with new data
+                if(data.status !== 'offline') {
+                    updateDashboard(data);
+                }
+            });
+    }, 10000);
+    
+    function updateDashboard(data) {
+        // Update risk level
+        const riskLevelEl = document.querySelector('.risk-level');
+        if(riskLevelEl) {
+            riskLevelEl.textContent = data.risk_level.toUpperCase();
+            riskLevelEl.className = `badge fs-6 ${
+                data.risk_level === 'safe' ? 'bg-success' : 
+                data.risk_level === 'warning' ? 'bg-warning' : 'bg-danger'
+            }`;
+        }
+        
+        // Update gas value
+        const gasEl = document.querySelector('.gas-value');
+        if(gasEl) gasEl.textContent = data.gas;
+        
+        // Update temperature
+        const tempEl = document.querySelector('.temp-value');
+        if(tempEl) tempEl.textContent = data.temperature.toFixed(1) + '°C';
+        
+        // Update helmet status
+        const helmetEl = document.querySelector('.helmet-status');
+        if(helmetEl) {
+            helmetEl.innerHTML = data.helmet_worn ? 
+                '<i class="fas fa-check-circle"></i> ON' : 
+                '<i class="fas fa-times-circle"></i> OFF';
+        }
+    }
+    
+    function sendSOS() {
+        if(confirm('Are you sure you want to send an SOS alert? This will immediately notify the manager.')) {
+            fetch('/api/worker/sos', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                }
+            })
+            .then(response => response.json())
+            .then(data => {
+                alert('SOS Alert Sent! Manager has been notified.');
+            })
+            .catch(error => {
+                alert('Error sending SOS alert. Please try again.');
+            });
+        }
+    }
+</script>
+{% endblock %}
+'''
+
+# Manager Dashboard template
+MANAGER_DASHBOARD_TEMPLATE = '''
+{% extends "base.html" %}
+
+{% block title %}Manager Dashboard{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h2>
+        <i class="fas fa-tachometer-alt"></i> Manager Dashboard
+    </h2>
+    <div>
+        <span class="badge bg-primary fs-6">
+            <i class="fas fa-users"></i> {{ workers|length }} Workers
+        </span>
+        <span class="badge bg-danger ms-2 fs-6">
+            <i class="fas fa-exclamation-triangle"></i> {{ alerts|length }} Active Alerts
+        </span>
+    </div>
+</div>
+
+<!-- Quick Stats -->
+<div class="row mb-4">
+    <div class="col-md-3 mb-3">
+        <div class="stat-card">
+            <div class="d-flex justify-content-between align-items-center">
+                <div>
+                    <h6>Active Workers</h6>
+                    <h2>{{ workers|selectattr('is_active')|list|length }}</h2>
+                </div>
+                <div class="fs-1">
+                    <i class="fas fa-user-check"></i>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="col-md-3 mb-3">
+        <div class="stat-card" style="background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);">
+            <div class="d-flex justify-content-between align-items-center">
+                <div>
+                    <h6>High Risk</h6>
+                    <h2>{{ workers|selectattr('risk_level', 'equalto', 'danger')|list|length }}</h2>
+                </div>
+                <div class="fs-1">
+                    <i class="fas fa-exclamation-circle"></i>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="col-md-3 mb-3">
+        <div class="stat-card" style="background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);">
+            <div class="d-flex justify-content-between align-items-center">
+                <div>
+                    <h6>Today's Hours</h6>
+                    <h2>{{ "%.1f"|format(workers|sum(attribute='today_hours')) }}</h2>
+                </div>
+                <div class="fs-1">
+                    <i class="fas fa-clock"></i>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="col-md-3 mb-3">
+        <div class="stat-card" style="background: linear-gradient(135deg, #43e97b 0%, #38f9d7 100%);">
+            <div class="d-flex justify-content-between align-items-center">
+                <div>
+                    <h6>Safe Workers</h6>
+                    <h2>{{ workers|selectattr('risk_level', 'equalto', 'safe')|list|length }}</h2>
+                </div>
+                <div class="fs-1">
+                    <i class="fas fa-shield-alt"></i>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="row">
+    <!-- Workers List -->
+    <div class="col-lg-8">
+        <div class="card">
+            <div class="card-header bg-primary text-white">
+                <h5 class="mb-0">
+                    <i class="fas fa-users"></i> Active Workers Monitor
+                </h5>
+            </div>
+            <div class="card-body">
+                <div class="table-responsive">
+                    <table class="table table-hover">
+                        <thead>
+                            <tr>
+                                <th>Worker</th>
+                                <th>Department</th>
+                                <th>Helmet</th>
+                                <th>Status</th>
+                                <th>Risk</th>
+                                <th>Hours</th>
+                                <th>Last Update</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for worker in workers %}
+                            <tr class="{% if not worker.is_active %}table-light{% elif worker.risk_level == 'danger' %}table-danger{% elif worker.risk_level == 'warning' %}table-warning{% endif %}">
+                                <td>
+                                    <strong>{{ worker.name }}</strong><br>
+                                    <small class="text-muted">{{ worker.worker_id }}</small>
+                                </td>
+                                <td>{{ worker.department }}</td>
+                                <td>
+                                    <span class="badge bg-info">{{ worker.helmet_id }}</span>
+                                </td>
+                                <td>
+                                    {% if worker.is_active %}
+                                    <span class="badge bg-success">
+                                        <i class="fas fa-circle"></i> Active
+                                    </span>
+                                    {% else %}
+                                    <span class="badge bg-secondary">
+                                        <i class="fas fa-circle"></i> Offline
+                                    </span>
+                                    {% endif %}
+                                </td>
+                                <td>
+                                    <span class="badge 
+                                        {% if worker.risk_level == 'safe' or worker.risk_level == 'inactive' %}bg-success
+                                        {% elif worker.risk_level == 'warning' %}bg-warning
+                                        {% else %}bg-danger{% endif %}">
+                                        {{ worker.risk_score }}
+                                    </span>
+                                </td>
+                                <td>
+                                    <strong>{{ worker.today_hours|default(0) }}</strong> hrs
+                                </td>
+                                <td>
+                                    {% if worker.last_update %}
+                                        <small>{{ worker.last_update.strftime('%H:%M:%S') }}</small>
+                                    {% else %}
+                                        <small>No data</small>
+                                    {% endif %}
+                                </td>
+                                <td>
+                                    <button class="btn btn-sm btn-outline-primary" onclick="viewWorkerDetails('{{ worker.worker_id }}')">
+                                        <i class="fas fa-eye"></i>
+                                    </button>
+                                    {% if worker.risk_level == 'danger' %}
+                                    <button class="btn btn-sm btn-danger" onclick="sendAlert('{{ worker.worker_id }}')">
+                                        <i class="fas fa-bell"></i>
+                                    </button>
+                                    {% endif %}
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Active Alerts -->
+    <div class="col-lg-4">
+        <div class="card">
+            <div class="card-header bg-danger text-white">
+                <h5 class="mb-0">
+                    <i class="fas fa-exclamation-triangle"></i> Active Alerts
+                </h5>
+            </div>
+            <div class="card-body" style="max-height: 500px; overflow-y: auto;">
+                {% if alerts %}
+                    {% for alert in alerts %}
+                    <div class="alert alert-warning alert-dismissible fade show mb-3" role="alert">
+                        <div class="d-flex justify-content-between align-items-start">
+                            <div>
+                                <h6 class="alert-heading">
+                                    <i class="fas fa-exclamation-circle"></i> {{ alert.worker_name }}
+                                </h6>
+                                <p class="mb-1">{{ alert.message }}</p>
+                                <small class="text-muted">
+                                    {{ alert.timestamp.strftime('%H:%M:%S') }} • 
+                                    Risk: <strong>{{ alert.risk_score }}</strong>
+                                </small>
+                            </div>
+                            <button type="button" class="btn-close" data-bs-dismiss="alert" 
+                                    onclick="acknowledgeAlert({{ alert.id }})"></button>
+                        </div>
+                    </div>
+                    {% endfor %}
+                {% else %}
+                <div class="text-center py-4">
+                    <div class="mb-3" style="font-size: 3em; color: #28a745;">
+                        <i class="fas fa-check-circle"></i>
+                    </div>
+                    <h4>All Clear!</h4>
+                    <p class="text-muted">No active alerts at the moment.</p>
+                </div>
+                {% endif %}
+            </div>
+        </div>
+        
+        <!-- Quick Actions -->
+        <div class="card mt-4">
+            <div class="card-header bg-secondary text-white">
+                <h5 class="mb-0">
+                    <i class="fas fa-bolt"></i> Quick Actions
+                </h5>
+            </div>
+            <div class="card-body">
+                <div class="d-grid gap-2">
+                    <button class="btn btn-primary" onclick="generateReport()">
+                        <i class="fas fa-file-pdf"></i> Generate Daily Report
+                    </button>
+                    <button class="btn btn-warning" onclick="sendAllAlert()">
+                        <i class="fas fa-bullhorn"></i> Broadcast Alert
+                    </button>
+                    <button class="btn btn-info" onclick="viewAllReports()">
+                        <i class="fas fa-chart-bar"></i> View Analytics
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Charts Section -->
+<div class="row mt-4">
+    <div class="col-lg-6">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0">
+                    <i class="fas fa-chart-pie"></i> Risk Distribution
+                </h5>
+            </div>
+            <div class="card-body">
+                <canvas id="riskChart" height="250"></canvas>
+            </div>
+        </div>
+    </div>
+    
+    <div class="col-lg-6">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0">
+                    <i class="fas fa-chart-line"></i> Daily Activity
+                </h5>
+            </div>
+            <div class="card-body">
+                <canvas id="activityChart" height="250"></canvas>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Department Overview -->
+<div class="row mt-4">
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header bg-info text-white">
+                <h5 class="mb-0">
+                    <i class="fas fa-building"></i> Department Overview
+                </h5>
+            </div>
+            <div class="card-body">
+                <div class="row">
+                    {% set departments = workers|map(attribute='department')|unique|list %}
+                    {% for dept in departments if dept %}
+                    <div class="col-md-3 mb-3">
+                        <div class="card">
+                            <div class="card-body">
+                                <h6>{{ dept }}</h6>
+                                {% set dept_workers = workers|selectattr('department', 'equalto', dept)|list %}
+                                <h2>{{ dept_workers|length }}</h2>
+                                <small>Workers</small>
+                                
+                                <div class="mt-3">
+                                    <small>
+                                        <span class="text-success">●</span> Safe: {{ dept_workers|selectattr('risk_level', 'equalto', 'safe')|list|length }}<br>
+                                        <span class="text-warning">●</span> Warning: {{ dept_workers|selectattr('risk_level', 'equalto', 'warning')|list|length }}<br>
+                                        <span class="text-danger">●</span> Danger: {{ dept_workers|selectattr('risk_level', 'equalto', 'danger')|list|length }}
+                                    </small>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    {% endfor %}
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    // Initialize charts
+    document.addEventListener('DOMContentLoaded', function() {
+        // Risk Distribution Chart
+        const riskCtx = document.getElementById('riskChart').getContext('2d');
+        const safeCount = {{ workers|selectattr('risk_level', 'equalto', 'safe')|list|length }};
+        const warningCount = {{ workers|selectattr('risk_level', 'equalto', 'warning')|list|length }};
+        const dangerCount = {{ workers|selectattr('risk_level', 'equalto', 'danger')|list|length }};
+        
+        new Chart(riskCtx, {
+            type: 'doughnut',
+            data: {
+                labels: ['Safe', 'Warning', 'Danger'],
+                datasets: [{
+                    data: [safeCount, warningCount, dangerCount],
+                    backgroundColor: ['#28a745', '#ffc107', '#dc3545'],
+                    borderWidth: 1
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: {
+                        position: 'bottom'
+                    }
+                }
+            }
+        });
+        
+        // Activity Chart
+        const activityCtx = document.getElementById('activityChart').getContext('2d');
+        new Chart(activityCtx, {
+            type: 'line',
+            data: {
+                labels: ['6AM', '8AM', '10AM', '12PM', '2PM', '4PM', '6PM'],
+                datasets: [{
+                    label: 'Active Workers',
+                    data: [5, 12, 15, 18, 16, 14, 8],
+                    borderColor: '#007bff',
+                    backgroundColor: 'rgba(0, 123, 255, 0.1)',
+                    fill: true,
+                    tension: 0.4
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                scales: {
+                    y: {
+                        beginAtZero: true,
+                        max: 20
+                    }
+                }
+            }
+        });
+    });
+    
+    function viewWorkerDetails(workerId) {
+        window.location.href = `/worker/${workerId}/details`;
+    }
+    
+    function acknowledgeAlert(alertId) {
+        fetch(`/api/alerts/${alertId}/acknowledge`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            }
+        })
+        .then(response => response.json())
+        .then(data => {
+            if(data.status === 'success') {
+                location.reload();
+            }
+        });
+    }
+    
+    function sendAlert(workerId) {
+        fetch(`/api/manager/alert/${workerId}`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                message: 'Manager Alert: Please check your safety status immediately!'
+            })
+        })
+        .then(response => response.json())
+        .then(data => {
+            alert('Alert sent to worker!');
+        });
+    }
+    
+    function generateReport() {
+        window.open('/api/reports/daily/pdf', '_blank');
+    }
+    
+    function sendAllAlert() {
+        const message = prompt('Enter broadcast message:');
+        if(message) {
+            fetch('/api/manager/broadcast', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ message: message })
+            })
+            .then(response => response.json())
+            .then(data => {
+                alert('Broadcast sent to all workers!');
+            });
+        }
+    }
+    
+    function viewAllReports() {
+        window.location.href = '/reports';
+    }
+    
+    // Auto-refresh dashboard every 30 seconds
+    setInterval(() => {
+        fetch('/api/manager/workers')
+            .then(response => response.json())
+            .then(data => {
+                console.log('Dashboard refreshed');
+            });
+    }, 30000);
+</script>
+{% endblock %}
+'''
+
+# Reports template
+REPORTS_TEMPLATE = '''
+{% extends "base.html" %}
+
+{% block title %}Reports & Analytics{% endblock %}
+
+{% block content %}
+<div class="container-fluid">
+    <!-- Page Header -->
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <h2>
+            <i class="fas fa-chart-bar"></i> Reports & Analytics
+        </h2>
+        <div class="btn-group">
+            <button class="btn btn-outline-primary" onclick="refreshReports()">
+                <i class="fas fa-sync-alt"></i> Refresh
+            </button>
+            <button class="btn btn-success" onclick="generatePDF()">
+                <i class="fas fa-file-pdf"></i> Export PDF
+            </button>
+            <button class="btn btn-info" onclick="exportCSV()">
+                <i class="fas fa-file-csv"></i> Export CSV
+            </button>
+        </div>
+    </div>
+
+    <!-- Date Range Selector -->
+    <div class="card mb-4">
+        <div class="card-body">
+            <h5 class="card-title">
+                <i class="fas fa-calendar-alt"></i> Select Date Range
+            </h5>
+            <div class="row">
+                <div class="col-md-3 mb-3">
+                    <label class="form-label">From Date</label>
+                    <input type="date" class="form-control" id="fromDate" value="{{ today }}">
+                </div>
+                <div class="col-md-3 mb-3">
+                    <label class="form-label">To Date</label>
+                    <input type="date" class="form-control" id="toDate" value="{{ today }}">
+                </div>
+                <div class="col-md-3 mb-3">
+                    <label class="form-label">Department</label>
+                    <select class="form-select" id="departmentFilter">
+                        <option value="all">All Departments</option>
+                        <option value="Construction">Construction</option>
+                        <option value="Mining">Mining</option>
+                        <option value="Manufacturing">Manufacturing</option>
+                        <option value="Warehouse">Warehouse</option>
+                    </select>
+                </div>
+                <div class="col-md-3 mb-3 d-flex align-items-end">
+                    <button class="btn btn-primary w-100" onclick="loadReportData()">
+                        <i class="fas fa-filter"></i> Apply Filters
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Key Performance Indicators -->
+    <div class="row mb-4">
+        <div class="col-md-3 col-6 mb-3">
+            <div class="card bg-primary text-white">
+                <div class="card-body text-center">
+                    <h6>Total Work Hours</h6>
+                    <h2 id="totalHours">0</h2>
+                    <small id="hoursChange" class="text-white-50">0% vs last period</small>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-3 col-6 mb-3">
+            <div class="card bg-warning text-white">
+                <div class="card-body text-center">
+                    <h6>Average Risk Score</h6>
+                    <h2 id="avgRisk">0</h2>
+                    <small id="riskChange" class="text-white-50">0% vs last period</small>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-3 col-6 mb-3">
+            <div class="card bg-danger text-white">
+                <div class="card-body text-center">
+                    <h6>Total Alerts</h6>
+                    <h2 id="totalAlerts">0</h2>
+                    <small id="alertsChange" class="text-white-50">0% vs last period</small>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-3 col-6 mb-3">
+            <div class="card bg-success text-white">
+                <div class="card-body text-center">
+                    <h6>Safety Compliance</h6>
+                    <h2 id="compliance">0%</h2>
+                    <small id="complianceChange" class="text-white-50">0% vs last period</small>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Charts Section -->
+    <div class="row mb-4">
+        <div class="col-lg-8">
+            <div class="card">
+                <div class="card-header">
+                    <h5 class="mb-0">
+                        <i class="fas fa-chart-line"></i> Daily Safety Metrics
+                    </h5>
+                </div>
+                <div class="card-body">
+                    <canvas id="dailyChart" height="300"></canvas>
+                </div>
+            </div>
+        </div>
+        <div class="col-lg-4">
+            <div class="card">
+                <div class="card-header">
+                    <h5 class="mb-0">
+                        <i class="fas fa-chart-pie"></i> Risk Distribution
+                    </h5>
+                </div>
+                <div class="card-body">
+                    <canvas id="riskPieChart" height="300"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Department Comparison -->
+    <div class="row mb-4">
+        <div class="col-12">
+            <div class="card">
+                <div class="card-header">
+                    <h5 class="mb-0">
+                        <i class="fas fa-building"></i> Department Comparison
+                    </h5>
+                </div>
+                <div class="card-body">
+                    <canvas id="departmentChart" height="250"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Worker Performance Table -->
+    <div class="row">
+        <div class="col-12">
+            <div class="card">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                    <h5 class="mb-0">
+                        <i class="fas fa-users"></i> Worker Performance Report
+                    </h5>
+                    <div class="form-check form-switch">
+                        <input class="form-check-input" type="checkbox" id="showDetails" onchange="toggleWorkerDetails()">
+                        <label class="form-check-label" for="showDetails">Show Details</label>
+                    </div>
+                </div>
+                <div class="card-body">
+                    <div class="table-responsive">
+                        <table class="table table-hover" id="workersTable">
+                            <thead>
+                                <tr>
+                                    <th>Worker</th>
+                                    <th>Department</th>
+                                    <th>Work Hours</th>
+                                    <th>Avg Risk Score</th>
+                                    <th>Alerts</th>
+                                    <th>Helmet Usage</th>
+                                    <th>Safety Score</th>
+                                    <th>Details</th>
+                                </tr>
+                            </thead>
+                            <tbody id="workersBody">
+                                <!-- Will be populated by JS -->
+                                <tr>
+                                    <td colspan="8" class="text-center py-5">
+                                        <div class="spinner-border text-primary" role="status">
+                                            <span class="visually-hidden">Loading...</span>
+                                        </div>
+                                        <p class="mt-2">Loading worker data...</p>
+                                    </td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    
+                    <!-- Worker Detail Rows (hidden by default) -->
+                    <div id="workerDetails" class="mt-3 d-none">
+                        <h6>Detailed Breakdown</h6>
+                        <div id="detailsContent"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Alert Analysis -->
+    <div class="row mt-4">
+        <div class="col-lg-6">
+            <div class="card">
+                <div class="card-header">
+                    <h5 class="mb-0">
+                        <i class="fas fa-exclamation-triangle"></i> Top Alert Types
+                    </h5>
+                </div>
+                <div class="card-body">
+                    <div id="alertTypesList"></div>
+                </div>
+            </div>
+        </div>
+        <div class="col-lg-6">
+            <div class="card">
+                <div class="card-header">
+                    <h5 class="mb-0">
+                        <i class="fas fa-clock"></i> Peak Alert Times
+                    </h5>
+                </div>
+                <div class="card-body">
+                    <div id="peakTimesList"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Report Generation Modal -->
+<div class="modal fade" id="reportModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Generate Report</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <div class="mb-3">
+                    <label class="form-label">Report Type</label>
+                    <select class="form-select" id="reportType">
+                        <option value="daily">Daily Summary</option>
+                        <option value="weekly">Weekly Analysis</option>
+                        <option value="monthly">Monthly Report</option>
+                        <option value="custom">Custom Period</option>
+                    </select>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label">Include Charts</label>
+                    <div class="form-check">
+                        <input class="form-check-input" type="checkbox" id="includeCharts" checked>
+                        <label class="form-check-label" for="includeCharts">
+                            Include charts and graphs
+                        </label>
+                    </div>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label">Format</label>
+                    <select class="form-select" id="reportFormat">
+                        <option value="pdf">PDF Document</option>
+                        <option value="excel">Excel Spreadsheet</option>
+                        <option value="html">HTML Report</option>
+                    </select>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-primary" onclick="generateReport()">
+                    <i class="fas fa-download"></i> Generate Report
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2.0.0"></script>
+<script>
+    // Global variables
+    let reportData = {};
+    let dailyChart = null;
+    let riskPieChart = null;
+    let departmentChart = null;
+
+    // Initialize when page loads
+    document.addEventListener('DOMContentLoaded', function() {
+        // Set default dates (today and 7 days ago)
+        const today = new Date().toISOString().split('T')[0];
+        const weekAgo = new Date();
+        weekAgo.setDate(weekAgo.getDate() - 7);
+        const weekAgoStr = weekAgo.toISOString().split('T')[0];
+        
+        document.getElementById('fromDate').value = weekAgoStr;
+        document.getElementById('toDate').value = today;
+        
+        loadReportData();
+    });
+
+    // Load report data
+    function loadReportData() {
+        const fromDate = document.getElementById('fromDate').value;
+        const toDate = document.getElementById('toDate').value;
+        const department = document.getElementById('departmentFilter').value;
+        
+        // Show loading state
+        document.getElementById('workersBody').innerHTML = `
+            <tr>
+                <td colspan="8" class="text-center py-5">
+                    <div class="spinner-border text-primary" role="status">
+                        <span class="visually-hidden">Loading...</span>
+                    </div>
+                    <p class="mt-2">Loading report data...</p>
+                </td>
+            </tr>
+        `;
+        
+        // Fetch report data
+        fetch(`/api/reports/daily?from=${fromDate}&to=${toDate}&department=${department}`)
+            .then(response => response.json())
+            .then(data => {
+                reportData = data;
+                updateKPIs();
+                updateCharts();
+                updateWorkerTable();
+                updateAlertAnalysis();
+            })
+            .catch(error => {
+                console.error('Error loading report:', error);
+                showToast('Failed to load report data', 'danger');
+            });
+    }
+
+    // Update Key Performance Indicators
+    function updateKPIs() {
+        const kpis = reportData.kpis || {};
+        
+        document.getElementById('totalHours').textContent = kpis.total_hours || '0';
+        document.getElementById('avgRisk').textContent = kpis.avg_risk || '0';
+        document.getElementById('totalAlerts').textContent = kpis.total_alerts || '0';
+        document.getElementById('compliance').textContent = kpis.compliance || '0%';
+        
+        // Update change indicators
+        document.getElementById('hoursChange').textContent = formatChange(kpis.hours_change);
+        document.getElementById('riskChange').textContent = formatChange(kpis.risk_change);
+        document.getElementById('alertsChange').textContent = formatChange(kpis.alerts_change);
+        document.getElementById('complianceChange').textContent = formatChange(kpis.compliance_change);
+    }
+
+    // Format change percentage
+    function formatChange(change) {
+        if (!change) return '0% vs last period';
+        const sign = change >= 0 ? '+' : '';
+        return `${sign}${change}% vs last period`;
+    }
+
+    // Update charts
+    function updateCharts() {
+        updateDailyChart();
+        updateRiskPieChart();
+        updateDepartmentChart();
+    }
+
+    // Update daily chart
+    function updateDailyChart() {
+        const dailyData = reportData.daily_data || [];
+        const ctx = document.getElementById('dailyChart').getContext('2d');
+        
+        if (dailyChart) dailyChart.destroy();
+        
+        const labels = dailyData.map(d => d.date);
+        const riskScores = dailyData.map(d => d.avg_risk);
+        const alerts = dailyData.map(d => d.alerts);
+        const hours = dailyData.map(d => d.hours);
+        
+        dailyChart = new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: labels,
+                datasets: [
+                    {
+                        label: 'Average Risk Score',
+                        data: riskScores,
+                        borderColor: '#e74c3c',
+                        backgroundColor: 'rgba(231, 76, 60, 0.1)',
+                        yAxisID: 'y',
+                        tension: 0.4
+                    },
+                    {
+                        label: 'Alerts',
+                        data: alerts,
+                        borderColor: '#f39c12',
+                        backgroundColor: 'rgba(243, 156, 18, 0.1)',
+                        yAxisID: 'y1',
+                        type: 'bar'
+                    }
+                ]
+            },
+            options: {
+                responsive: true,
+                interaction: {
+                    mode: 'index',
+                    intersect: false,
+                },
+                scales: {
+                    y: {
+                        type: 'linear',
+                        display: true,
+                        position: 'left',
+                        title: {
+                            display: true,
+                            text: 'Risk Score'
+                        }
+                    },
+                    y1: {
+                        type: 'linear',
+                        display: true,
+                        position: 'right',
+                        title: {
+                            display: true,
+                            text: 'Number of Alerts'
+                        },
+                        grid: {
+                            drawOnChartArea: false,
+                        },
+                    },
+                }
+            }
+        });
+    }
+
+    // Update risk pie chart
+    function updateRiskPieChart() {
+        const riskDistribution = reportData.risk_distribution || {safe: 0, warning: 0, danger: 0};
+        const ctx = document.getElementById('riskPieChart').getContext('2d');
+        
+        if (riskPieChart) riskPieChart.destroy();
+        
+        riskPieChart = new Chart(ctx, {
+            type: 'doughnut',
+            data: {
+                labels: ['Safe (<30)', 'Warning (31-60)', 'Danger (>60)'],
+                datasets: [{
+                    data: [riskDistribution.safe, riskDistribution.warning, riskDistribution.danger],
+                    backgroundColor: ['#2ecc71', '#f39c12', '#e74c3c'],
+                    borderWidth: 1
+                }]
+            },
+            options: {
+                responsive: true,
+                plugins: {
+                    legend: {
+                        position: 'bottom'
+                    },
+                    tooltip: {
+                        callbacks: {
+                            label: function(context) {
+                                const total = context.dataset.data.reduce((a, b) => a + b, 0);
+                                const value = context.raw;
+                                const percentage = Math.round((value / total) * 100);
+                                return `${context.label}: ${value} (${percentage}%)`;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // Update department chart
+    function updateDepartmentChart() {
+        const deptData = reportData.department_data || [];
+        const ctx = document.getElementById('departmentChart').getContext('2d');
+        
+        if (departmentChart) departmentChart.destroy();
+        
+        const labels = deptData.map(d => d.department);
+        const riskScores = deptData.map(d => d.avg_risk);
+        const hours = deptData.map(d => d.total_hours);
+        const alerts = deptData.map(d => d.alerts);
+        
+        departmentChart = new Chart(ctx, {
+            type: 'bar',
+            data: {
+                labels: labels,
+                datasets: [
+                    {
+                        label: 'Avg Risk Score',
+                        data: riskScores,
+                        backgroundColor: 'rgba(231, 76, 60, 0.7)',
+                        yAxisID: 'y'
+                    },
+                    {
+                        label: 'Work Hours',
+                        data: hours,
+                        backgroundColor: 'rgba(52, 152, 219, 0.7)',
+                        yAxisID: 'y1',
+                        type: 'line'
+                    }
+                ]
+            },
+            options: {
+                responsive: true,
+                scales: {
+                    y: {
+                        type: 'linear',
+                        display: true,
+                        position: 'left',
+                        title: {
+                            display: true,
+                            text: 'Risk Score'
+                        }
+                    },
+                    y1: {
+                        type: 'linear',
+                        display: true,
+                        position: 'right',
+                        title: {
+                            display: true,
+                            text: 'Work Hours'
+                        },
+                        grid: {
+                            drawOnChartArea: false,
+                        },
+                    }
+                }
+            }
+        });
+    }
+
+    // Update worker table
+    function updateWorkerTable() {
+        const workers = reportData.workers || [];
+        let html = '';
+        
+        if (workers.length === 0) {
+            html = `
+                <tr>
+                    <td colspan="8" class="text-center py-5">
+                        <div class="mb-3" style="font-size: 3em; color: #ccc;">
+                            <i class="fas fa-users-slash"></i>
+                        </div>
+                        <h5>No Worker Data Found</h5>
+                        <p class="text-muted">Try adjusting your date range or filters.</p>
+                    </td>
+                </tr>
+            `;
+        } else {
+            workers.forEach(worker => {
+                // Calculate safety score (0-100)
+                const safetyScore = calculateSafetyScore(worker);
+                
+                html += `
+                <tr onclick="showWorkerDetails('${worker.worker_id}')" style="cursor: pointer;">
+                    <td>
+                        <strong>${worker.name}</strong><br>
+                        <small class="text-muted">${worker.worker_id}</small>
+                    </td>
+                    <td>${worker.department}</td>
+                    <td>
+                        <div class="progress" style="height: 20px;">
+                            <div class="progress-bar bg-primary" style="width: ${Math.min(worker.hours / 8 * 100, 100)}%">
+                                ${worker.hours}h
+                            </div>
+                        </div>
+                    </td>
+                    <td>
+                        <span class="badge ${getRiskBadgeClass(worker.avg_risk)}">
+                            ${worker.avg_risk.toFixed(1)}
+                        </span>
+                    </td>
+                    <td>
+                        ${worker.alerts}
+                        ${worker.alerts > 0 ? `<span class="badge bg-danger ms-1">${worker.high_risk_alerts}</span>` : ''}
+                    </td>
+                    <td>
+                        <div class="progress" style="height: 20px;">
+                            <div class="progress-bar ${worker.helmet_usage > 90 ? 'bg-success' : 'bg-warning'}" 
+                                 style="width: ${worker.helmet_usage}%">
+                                ${worker.helmet_usage}%
+                            </div>
+                        </div>
+                    </td>
+                    <td>
+                        <div class="progress" style="height: 20px;">
+                            <div class="progress-bar ${safetyScore > 80 ? 'bg-success' : safetyScore > 60 ? 'bg-warning' : 'bg-danger'}" 
+                                 style="width: ${safetyScore}%">
+                                ${safetyScore}%
+                            </div>
+                        </div>
+                    </td>
+                    <td>
+                        <button class="btn btn-sm btn-outline-primary" onclick="event.stopPropagation(); showWorkerDetails('${worker.worker_id}')">
+                            <i class="fas fa-chart-bar"></i>
+                        </button>
+                    </td>
+                </tr>
+                `;
+            });
+        }
+        
+        document.getElementById('workersBody').innerHTML = html;
+    }
+
+    // Calculate safety score
+    function calculateSafetyScore(worker) {
+        let score = 100;
+        
+        // Deduct for risk score
+        score -= worker.avg_risk * 0.5;
+        
+        // Deduct for alerts
+        score -= worker.alerts * 2;
+        score -= worker.high_risk_alerts * 5;
+        
+        // Add for helmet usage
+        score += (worker.helmet_usage - 80) * 0.5;
+        
+        // Clamp between 0 and 100
+        return Math.max(0, Math.min(100, Math.round(score)));
+    }
+
+    // Get risk badge class
+    function getRiskBadgeClass(score) {
+        if (score <= 30) return 'bg-success';
+        if (score <= 60) return 'bg-warning';
+        return 'bg-danger';
+    }
+
+    // Show worker details
+    function showWorkerDetails(workerId) {
+        const worker = reportData.workers.find(w => w.worker_id === workerId);
+        if (!worker) return;
+        
+        const details = reportData.worker_details?.[workerId] || {};
+        
+        let content = `
+            <div class="card">
+                <div class="card-header">
+                    <h5 class="mb-0">${worker.name} - Performance Details</h5>
+                </div>
+                <div class="card-body">
+                    <div class="row">
+                        <div class="col-md-6">
+                            <h6>Basic Info</h6>
+                            <table class="table table-sm">
+                                <tr><td>Worker ID:</td><td>${worker.worker_id}</td></tr>
+                                <tr><td>Department:</td><td>${worker.department}</td></tr>
+                                <tr><td>Helmet ID:</td><td>${worker.helmet_id}</td></tr>
+                                <tr><td>Work Sessions:</td><td>${worker.sessions}</td></tr>
+                            </table>
+                        </div>
+                        <div class="col-md-6">
+                            <h6>Performance Metrics</h6>
+                            <table class="table table-sm">
+                                <tr><td>Total Hours:</td><td>${worker.hours} hours</td></tr>
+                                <tr><td>Avg Session:</td><td>${(worker.hours / worker.sessions).toFixed(1)} hours</td></tr>
+                                <tr><td>Helmet Usage:</td><td>${worker.helmet_usage}%</td></tr>
+                                <tr><td>Safety Score:</td><td>${calculateSafetyScore(worker)}%</td></tr>
+                            </table>
+                        </div>
+                    </div>
+                    
+                    <div class="mt-3">
+                        <h6>Alert Breakdown</h6>
+                        <div class="row">
+                            <div class="col-md-3">
+                                <div class="card bg-danger text-white text-center">
+                                    <div class="card-body">
+                                        <h6>Total Alerts</h6>
+                                        <h3>${worker.alerts}</h3>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-md-3">
+                                <div class="card bg-warning text-white text-center">
+                                    <div class="card-body">
+                                        <h6>High Risk</h6>
+                                        <h3>${worker.high_risk_alerts}</h3>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-md-3">
+                                <div class="card bg-info text-white text-center">
+                                    <div class="card-body">
+                                        <h6>Gas Alerts</h6>
+                                        <h3>${details.gas_alerts || 0}</h3>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-md-3">
+                                <div class="card bg-secondary text-white text-center">
+                                    <div class="card-body">
+                                        <h6>Fall Alerts</h6>
+                                        <h3>${details.fall_alerts || 0}</h3>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="mt-3">
+                        <h6>Recommendations</h6>
+                        <div class="alert ${calculateSafetyScore(worker) > 80 ? 'alert-success' : calculateSafetyScore(worker) > 60 ? 'alert-warning' : 'alert-danger'}">
+                            ${generateRecommendations(worker)}
+                        </div>
+                    </div>
+                </div>
+            </div>
+        `;
+        
+        document.getElementById('detailsContent').innerHTML = content;
+        document.getElementById('workerDetails').classList.remove('d-none');
+    }
+
+    // Generate recommendations
+    function generateRecommendations(worker) {
+        const recommendations = [];
+        
+        if (worker.helmet_usage < 90) {
+            recommendations.push('Improve helmet usage compliance');
+        }
+        
+        if (worker.avg_risk > 60) {
+            recommendations.push('Address high-risk working conditions');
+        }
+        
+        if (worker.high_risk_alerts > 0) {
+            recommendations.push('Review and address high-risk alerts');
+        }
+        
+        if (worker.alerts > 5) {
+            recommendations.push('Conduct safety training');
+        }
+        
+        if (recommendations.length === 0) {
+            return 'Excellent safety performance! Keep up the good work.';
+        }
+        
+        return 'Recommendations: ' + recommendations.join(', ');
+    }
+
+    // Toggle worker details
+    function toggleWorkerDetails() {
+        const details = document.getElementById('workerDetails');
+        const checkbox = document.getElementById('showDetails');
+        
+        if (checkbox.checked) {
+            details.classList.remove('d-none');
+        } else {
+            details.classList.add('d-none');
+        }
+    }
+
+    // Update alert analysis
+    function updateAlertAnalysis() {
+        const alertTypes = reportData.alert_types || [];
+        const peakTimes = reportData.peak_times || [];
+        
+        // Update alert types
+        let alertTypesHtml = '';
+        alertTypes.forEach((type, index) => {
+            alertTypesHtml += `
+                <div class="d-flex justify-content-between align-items-center mb-2">
+                    <span>
+                        <span class="badge ${getAlertTypeBadge(type.type)} me-2">${type.type}</span>
+                        ${type.count} alerts
+                    </span>
+                    <span class="text-muted">${type.percentage}%</span>
+                </div>
+                <div class="progress mb-3" style="height: 10px;">
+                    <div class="progress-bar ${getAlertTypeBadge(type.type)}" style="width: ${type.percentage}%"></div>
+                </div>
+            `;
+        });
+        document.getElementById('alertTypesList').innerHTML = alertTypesHtml;
+        
+        // Update peak times
+        let peakTimesHtml = '';
+        peakTimes.forEach(time => {
+            peakTimesHtml += `
+                <div class="d-flex justify-content-between align-items-center mb-2">
+                    <span>
+                        <i class="fas fa-clock me-2"></i>
+                        ${time.hour}:00 - ${time.hour}:59
+                    </span>
+                    <span class="badge bg-danger">${time.count} alerts</span>
+                </div>
+            `;
+        });
+        document.getElementById('peakTimesList').innerHTML = peakTimesHtml;
+    }
+
+    // Get alert type badge class
+    function getAlertTypeBadge(type) {
+        switch(type.toLowerCase()) {
+            case 'gas': return 'bg-danger';
+            case 'temperature': return 'bg-warning';
+            case 'fall': return 'bg-dark';
+            case 'helmet': return 'bg-info';
+            case 'sos': return 'bg-danger';
+            default: return 'bg-secondary';
+        }
+    }
+
+    // Generate PDF report
+    function generatePDF() {
+        const modal = new bootstrap.Modal(document.getElementById('reportModal'));
+        modal.show();
+    }
+
+    // Generate report
+    function generateReport() {
+        const format = document.getElementById('reportFormat').value;
+        
+        // In a real implementation, this would call your backend to generate the report
+        // For now, we'll simulate it
+        showToast(`Report generation started. This might take a moment...`, 'info');
+        
+        setTimeout(() => {
+            showToast(`Report generated successfully!`, 'success');
+            const modal = bootstrap.Modal.getInstance(document.getElementById('reportModal'));
+            modal.hide();
+            
+            // In a real app, you would download the file
+            // For now, we'll show a message
+            alert('In a real implementation, this would download the report file.');
+        }, 2000);
+    }
+
+    // Export CSV
+    function exportCSV() {
+        const workers = reportData.workers || [];
+        if (workers.length === 0) {
+            showToast('No data to export', 'warning');
+            return;
+        }
+        
+        // Create CSV content
+        let csv = 'Worker ID,Name,Department,Work Hours,Avg Risk Score,Alerts,High Risk Alerts,Helmet Usage,Safety Score\n';
+        
+        workers.forEach(worker => {
+            csv += `"${worker.worker_id}","${worker.name}","${worker.department}",${worker.hours},${worker.avg_risk},${worker.alerts},${worker.high_risk_alerts},${worker.helmet_usage},${calculateSafetyScore(worker)}\n`;
+        });
+        
+        // Create download link
+        const blob = new Blob([csv], { type: 'text/csv' });
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `safety_report_${new Date().toISOString().split('T')[0]}.csv`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        window.URL.revokeObjectURL(url);
+        
+        showToast('CSV exported successfully', 'success');
+    }
+
+    // Refresh reports
+    function refreshReports() {
+        loadReportData();
+        showToast('Reports refreshed', 'info');
+    }
+
+    // Show toast notification
+    function showToast(message, type = 'info') {
+        // Create toast if it doesn't exist
+        let toastContainer = document.getElementById('toastContainer');
+        if (!toastContainer) {
+            toastContainer = document.createElement('div');
+            toastContainer.id = 'toastContainer';
+            toastContainer.style.cssText = `
+                position: fixed;
+                top: 20px;
+                right: 20px;
+                z-index: 9999;
+            `;
+            document.body.appendChild(toastContainer);
+        }
+        
+        const toastId = 'toast-' + Date.now();
+        const toast = document.createElement('div');
+        toast.id = toastId;
+        toast.className = `alert alert-${type} alert-dismissible fade show`;
+        toast.innerHTML = `
+            ${message}
+            <button type="button" class="btn-close" onclick="document.getElementById('${toastId}').remove()"></button>
+        `;
+        toast.style.cssText = 'margin-bottom: 10px; min-width: 250px;';
+        
+        toastContainer.appendChild(toast);
+        
+        setTimeout(() => {
+            if (document.getElementById(toastId)) {
+                document.getElementById(toastId).remove();
+            }
+        }, 3000);
+    }
+</script>
+{% endblock %}
+'''
+
+# Alerts template
+ALERTS_TEMPLATE = '''
+{% extends "base.html" %}
+
+{% block title %}Alert Management{% endblock %}
+
+{% block content %}
+<div class="container-fluid">
+    <!-- Page Header -->
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <h2>
+            <i class="fas fa-exclamation-triangle"></i> Alert Management
+        </h2>
+        <div class="btn-group">
+            <button class="btn btn-outline-primary" onclick="refreshAlerts()">
+                <i class="fas fa-sync-alt"></i> Refresh
+            </button>
+            {% if session.role == 'manager' %}
+            <button class="btn btn-success" onclick="acknowledgeAll()">
+                <i class="fas fa-check-double"></i> Acknowledge All
+            </button>
+            {% endif %}
+        </div>
+    </div>
+
+    <!-- Alert Statistics -->
+    <div class="row mb-4">
+        <div class="col-md-3 col-6 mb-3">
+            <div class="card bg-primary text-white">
+                <div class="card-body text-center">
+                    <h6>Total Alerts</h6>
+                    <h2 id="totalAlerts">0</h2>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-3 col-6 mb-3">
+            <div class="card bg-warning text-white">
+                <div class="card-body text-center">
+                    <h6>Pending</h6>
+                    <h2 id="pendingAlerts">0</h2>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-3 col-6 mb-3">
+            <div class="card bg-danger text-white">
+                <div class="card-body text-center">
+                    <h6>High Risk</h6>
+                    <h2 id="highRiskAlerts">0</h2>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-3 col-6 mb-3">
+            <div class="card bg-success text-white">
+                <div class="card-body text-center">
+                    <h6>Resolved</h6>
+                    <h2 id="resolvedAlerts">0</h2>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Filter Options -->
+    <div class="card mb-4">
+        <div class="card-body">
+            <div class="row">
+                <div class="col-md-3 mb-3">
+                    <label class="form-label">Alert Type</label>
+                    <select class="form-select" id="filterType" onchange="filterAlerts()">
+                        <option value="all">All Types</option>
+                        <option value="gas">Gas Alert</option>
+                        <option value="temperature">Temperature</option>
+                        <option value="fall">Fall Detection</option>
+                        <option value="helmet">Helmet Status</option>
+                        <option value="sos">SOS Emergency</option>
+                    </select>
+                </div>
+                <div class="col-md-3 mb-3">
+                    <label class="form-label">Status</label>
+                    <select class="form-select" id="filterStatus" onchange="filterAlerts()">
+                        <option value="all">All Status</option>
+                        <option value="pending">Pending</option>
+                        <option value="acknowledged">Acknowledged</option>
+                    </select>
+                </div>
+                <div class="col-md-3 mb-3">
+                    <label class="form-label">Date Range</label>
+                    <select class="form-select" id="filterDate" onchange="filterAlerts()">
+                        <option value="today">Today</option>
+                        <option value="week">Last 7 Days</option>
+                        <option value="month">Last 30 Days</option>
+                        <option value="all">All Time</option>
+                    </select>
+                </div>
+                <div class="col-md-3 mb-3">
+                    <label class="form-label">Worker</label>
+                    <select class="form-select" id="filterWorker" onchange="filterAlerts()">
+                        <option value="all">All Workers</option>
+                        <!-- Will be populated by JS -->
+                    </select>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Alerts Table -->
+    <div class="card">
+        <div class="card-header bg-danger text-white d-flex justify-content-between align-items-center">
+            <h5 class="mb-0">
+                <i class="fas fa-bell"></i> Active Alerts
+            </h5>
+            <span class="badge bg-light text-danger" id="activeAlertCount">0 Active</span>
+        </div>
+        <div class="card-body">
+            <div class="table-responsive">
+                <table class="table table-hover" id="alertsTable">
+                    <thead>
+                        <tr>
+                            {% if session.role == 'manager' %}
+                            <th>Worker</th>
+                            {% endif %}
+                            <th>Time</th>
+                            <th>Type</th>
+                            <th>Risk Score</th>
+                            <th>Message</th>
+                            <th>Status</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="alertsBody">
+                        <!-- Will be populated by JavaScript -->
+                        <tr id="loadingRow">
+                            <td colspan="{% if session.role == 'manager' %}7{% else %}6{% endif %}" class="text-center py-5">
+                                <div class="spinner-border text-primary" role="status">
+                                    <span class="visually-hidden">Loading...</span>
+                                </div>
+                                <p class="mt-2">Loading alerts...</p>
+                            </td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+            
+            <!-- No Alerts Message -->
+            <div id="noAlerts" class="text-center py-5 d-none">
+                <div class="mb-3" style="font-size: 3em; color: #28a745;">
+                    <i class="fas fa-check-circle"></i>
+                </div>
+                <h4>All Clear!</h4>
+                <p class="text-muted">No alerts found for the selected filters.</p>
+            </div>
+            
+            <!-- Pagination -->
+            <nav aria-label="Alert pagination" class="mt-3">
+                <ul class="pagination justify-content-center" id="pagination">
+                    <!-- Will be generated by JS -->
+                </ul>
+            </nav>
+        </div>
+    </div>
+
+    <!-- Alert History Chart -->
+    <div class="row mt-4">
+        <div class="col-lg-8">
+            <div class="card">
+                <div class="card-header">
+                    <h5 class="mb-0">
+                        <i class="fas fa-chart-line"></i> Alert Trend (Last 7 Days)
+                    </h5>
+                </div>
+                <div class="card-body">
+                    <canvas id="alertChart" height="250"></canvas>
+                </div>
+            </div>
+        </div>
+        <div class="col-lg-4">
+            <div class="card">
+                <div class="card-header">
+                    <h5 class="mb-0">
+                        <i class="fas fa-chart-pie"></i> Alert Distribution
+                    </h5>
+                </div>
+                <div class="card-body">
+                    <canvas id="alertPieChart" height="250"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Alert Detail Modal -->
+<div class="modal fade" id="alertDetailModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Alert Details</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body" id="alertDetailContent">
+                <!-- Will be populated by JS -->
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                <button type="button" class="btn btn-success" id="acknowledgeBtn" onclick="acknowledgeAlert()">
+                    <i class="fas fa-check"></i> Acknowledge Alert
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script>
+    // Global variables
+    let allAlerts = [];
+    let currentPage = 1;
+    const alertsPerPage = 10;
+    let alertChart = null;
+    let pieChart = null;
+
+    // Initialize when page loads
+    document.addEventListener('DOMContentLoaded', function() {
+        loadAlerts();
+        loadWorkersForFilter();
+        
+        // Auto-refresh every 30 seconds
+        setInterval(loadAlerts, 30000);
+    });
+
+    // Load alerts from API
+    function loadAlerts() {
+        fetch('/api/alerts')
+            .then(response => response.json())
+            .then(data => {
+                allAlerts = data;
+                updateStatistics();
+                displayAlerts();
+                updateCharts();
+            })
+            .catch(error => {
+                console.error('Error loading alerts:', error);
+                document.getElementById('alertsBody').innerHTML = `
+                    <tr>
+                        <td colspan="{% if session.role == 'manager' %}7{% else %}6{% endif %}" class="text-center py-5 text-danger">
+                            <i class="fas fa-exclamation-circle fa-2x mb-3"></i>
+                            <p>Failed to load alerts. Please try again.</p>
+                        </td>
+                    </tr>
+                `;
+            });
+    }
+
+    // Load workers for filter dropdown
+    function loadWorkersForFilter() {
+        fetch('/api/manager/workers')
+            .then(response => response.json())
+            .then(workers => {
+                const select = document.getElementById('filterWorker');
+                workers.forEach(worker => {
+                    const option = document.createElement('option');
+                    option.value = worker.worker_id;
+                    option.textContent = `${worker.name} (${worker.worker_id})`;
+                    select.appendChild(option);
+                });
+            });
+    }
+
+    // Update statistics
+    function updateStatistics() {
+        const total = allAlerts.length;
+        const pending = allAlerts.filter(a => !a.acknowledged).length;
+        const highRisk = allAlerts.filter(a => a.risk_score >= 60).length;
+        const resolved = allAlerts.filter(a => a.acknowledged).length;
+
+        document.getElementById('totalAlerts').textContent = total;
+        document.getElementById('pendingAlerts').textContent = pending;
+        document.getElementById('highRiskAlerts').textContent = highRisk;
+        document.getElementById('resolvedAlerts').textContent = resolved;
+        document.getElementById('activeAlertCount').textContent = `${pending} Active`;
+    }
+
+    // Filter and display alerts
+    function filterAlerts() {
+        displayAlerts();
+    }
+
+    // Display alerts with pagination
+    function displayAlerts() {
+        const typeFilter = document.getElementById('filterType').value;
+        const statusFilter = document.getElementById('filterStatus').value;
+        const dateFilter = document.getElementById('filterDate').value;
+        const workerFilter = document.getElementById('filterWorker').value;
+
+        // Apply filters
+        let filteredAlerts = allAlerts.filter(alert => {
+            // Type filter
+            if (typeFilter !== 'all' && !alert.alert_type.toLowerCase().includes(typeFilter)) {
+                return false;
+            }
+            
+            // Status filter
+            if (statusFilter === 'pending' && alert.acknowledged) return false;
+            if (statusFilter === 'acknowledged' && !alert.acknowledged) return false;
+            
+            // Date filter
+            const alertDate = new Date(alert.timestamp);
+            const now = new Date();
+            if (dateFilter === 'today') {
+                const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+                if (alertDate < today) return false;
+            } else if (dateFilter === 'week') {
+                const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+                if (alertDate < weekAgo) return false;
+            } else if (dateFilter === 'month') {
+                const monthAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+                if (alertDate < monthAgo) return false;
+            }
+            
+            // Worker filter
+            if (workerFilter !== 'all' && alert.worker_id !== workerFilter) {
+                return false;
+            }
+            
+            return true;
+        });
+
+        // Sort by timestamp (newest first)
+        filteredAlerts.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+
+        // Calculate pagination
+        const totalPages = Math.ceil(filteredAlerts.length / alertsPerPage);
+        const startIndex = (currentPage - 1) * alertsPerPage;
+        const endIndex = startIndex + alertsPerPage;
+        const pageAlerts = filteredAlerts.slice(startIndex, endIndex);
+
+        // Generate table rows
+        let html = '';
+        if (pageAlerts.length === 0) {
+            document.getElementById('noAlerts').classList.remove('d-none');
+            document.getElementById('alertsTable').classList.add('d-none');
+        } else {
+            document.getElementById('noAlerts').classList.add('d-none');
+            document.getElementById('alertsTable').classList.remove('d-none');
+            
+            pageAlerts.forEach(alert => {
+                const time = new Date(alert.timestamp);
+                const timeStr = time.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+                const dateStr = time.toLocaleDateString();
+                
+                // Determine alert type badge
+                let typeBadgeClass = 'bg-secondary';
+                let typeIcon = 'fa-exclamation-circle';
+                
+                if (alert.alert_type.includes('gas')) {
+                    typeBadgeClass = 'bg-danger';
+                    typeIcon = 'fa-smog';
+                } else if (alert.alert_type.includes('temperature')) {
+                    typeBadgeClass = 'bg-warning';
+                    typeIcon = 'fa-temperature-high';
+                } else if (alert.alert_type.includes('fall')) {
+                    typeBadgeClass = 'bg-dark';
+                    typeIcon = 'fa-running';
+                } else if (alert.alert_type.includes('helmet')) {
+                    typeBadgeClass = 'bg-info';
+                    typeIcon = 'fa-helmet-safety';
+                } else if (alert.alert_type.includes('sos')) {
+                    typeBadgeClass = 'bg-danger';
+                    typeIcon = 'fa-sos';
+                }
+                
+                // Determine risk badge
+                let riskBadgeClass = 'bg-success';
+                if (alert.risk_score > 60) riskBadgeClass = 'bg-danger';
+                else if (alert.risk_score > 30) riskBadgeClass = 'bg-warning';
+                
+                html += `
+                <tr class="{% if not alert.acknowledged %}alert-row{% endif %}" onclick="showAlertDetail(${alert.id})" style="cursor: pointer;">
+                    {% if session.role == 'manager' %}
+                    <td>
+                        <strong>${alert.worker_name || 'Unknown'}</strong><br>
+                        <small class="text-muted">${alert.worker_id}</small>
+                    </td>
+                    {% endif %}
+                    <td>
+                        <strong>${timeStr}</strong><br>
+                        <small class="text-muted">${dateStr}</small><br>
+                        <small class="text-muted">${alert.time_ago}</small>
+                    </td>
+                    <td>
+                        <span class="badge ${typeBadgeClass}">
+                            <i class="fas ${typeIcon}"></i> ${alert.alert_type}
+                        </span>
+                    </td>
+                    <td>
+                        <span class="badge ${riskBadgeClass}">
+                            ${alert.risk_score}
+                        </span>
+                    </td>
+                    <td>${alert.message}</td>
+                    <td>
+                        ${alert.acknowledged ? 
+                            `<span class="badge bg-success">
+                                <i class="fas fa-check"></i> Acknowledged
+                            </span>` : 
+                            `<span class="badge bg-warning">
+                                <i class="fas fa-clock"></i> Pending
+                            </span>`
+                        }
+                    </td>
+                    <td>
+                        <button class="btn btn-sm btn-outline-primary" onclick="event.stopPropagation(); showAlertDetail(${alert.id})">
+                            <i class="fas fa-eye"></i>
+                        </button>
+                        {% if session.role == 'manager' and not alert.acknowledged %}
+                        <button class="btn btn-sm btn-success" onclick="event.stopPropagation(); acknowledgeSingle(${alert.id})">
+                            <i class="fas fa-check"></i>
+                        </button>
+                        {% endif %}
+                    </td>
+                </tr>
+                `;
+            });
+        }
+
+        document.getElementById('alertsBody').innerHTML = html;
+        generatePagination(totalPages);
+    }
+
+    // Generate pagination
+    function generatePagination(totalPages) {
+        const pagination = document.getElementById('pagination');
+        pagination.innerHTML = '';
+        
+        // Previous button
+        const prevLi = document.createElement('li');
+        prevLi.className = `page-item ${currentPage === 1 ? 'disabled' : ''}`;
+        prevLi.innerHTML = `
+            <a class="page-link" href="#" onclick="changePage(${currentPage - 1})">
+                <i class="fas fa-chevron-left"></i>
+            </a>
+        `;
+        pagination.appendChild(prevLi);
+        
+        // Page numbers
+        for (let i = 1; i <= totalPages; i++) {
+            const li = document.createElement('li');
+            li.className = `page-item ${i === currentPage ? 'active' : ''}`;
+            li.innerHTML = `
+                <a class="page-link" href="#" onclick="changePage(${i})">${i}</a>
+            `;
+            pagination.appendChild(li);
+        }
+        
+        // Next button
+        const nextLi = document.createElement('li');
+        nextLi.className = `page-item ${currentPage === totalPages ? 'disabled' : ''}`;
+        nextLi.innerHTML = `
+            <a class="page-link" href="#" onclick="changePage(${currentPage + 1})">
+                <i class="fas fa-chevron-right"></i>
+            </a>
+        `;
+        pagination.appendChild(nextLi);
+    }
+
+    // Change page
+    function changePage(page) {
+        currentPage = page;
+        displayAlerts();
+    }
+
+    // Show alert details
+    function showAlertDetail(alertId) {
+        const alert = allAlerts.find(a => a.id === alertId);
+        if (!alert) return;
+        
+        const modal = new bootstrap.Modal(document.getElementById('alertDetailModal'));
+        const time = new Date(alert.timestamp);
+        
+        let content = `
+            <div class="alert ${alert.acknowledged ? 'alert-success' : 'alert-danger'}">
+                <h5><i class="fas fa-exclamation-triangle"></i> ${alert.alert_type.toUpperCase()} ALERT</h5>
+            </div>
+            
+            <div class="row">
+                <div class="col-md-6">
+                    <h6>Worker Information</h6>
+                    <table class="table table-sm">
+                        <tr>
+                            <td><strong>Worker Name:</strong></td>
+                            <td>${alert.worker_name || 'Unknown'}</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Worker ID:</strong></td>
+                            <td>${alert.worker_id}</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Alert Time:</strong></td>
+                            <td>${time.toLocaleString()}</td>
+                        </tr>
+                    </table>
+                </div>
+                <div class="col-md-6">
+                    <h6>Alert Details</h6>
+                    <table class="table table-sm">
+                        <tr>
+                            <td><strong>Risk Score:</strong></td>
+                            <td>
+                                <span class="badge ${alert.risk_score > 60 ? 'bg-danger' : alert.risk_score > 30 ? 'bg-warning' : 'bg-success'}">
+                                    ${alert.risk_score}
+                                </span>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td><strong>Status:</strong></td>
+                            <td>
+                                ${alert.acknowledged ? 
+                                    '<span class="badge bg-success">Acknowledged</span>' : 
+                                    '<span class="badge bg-warning">Pending</span>'
+                                }
+                            </td>
+                        </tr>
+                        <tr>
+                            <td><strong>Duration:</strong></td>
+                            <td>${alert.time_ago}</td>
+                        </tr>
+                    </table>
+                </div>
+            </div>
+            
+            <div class="mt-3">
+                <h6>Alert Message</h6>
+                <div class="alert alert-light border">
+                    ${alert.message}
+                </div>
+            </div>
+            
+            {% if session.role == 'manager' %}
+            <div class="mt-3">
+                <h6>Action Taken</h6>
+                ${alert.acknowledged ? 
+                    `<p class="text-success">
+                        <i class="fas fa-check-circle"></i> 
+                        Acknowledged by ${alert.acknowledged_by} 
+                        at ${new Date(alert.acknowledged_at).toLocaleString()}
+                    </p>` : 
+                    '<p class="text-muted">No action taken yet.</p>'
+                }
+            </div>
+            {% endif %}
+        `;
+        
+        document.getElementById('alertDetailContent').innerHTML = content;
+        
+        // Show/hide acknowledge button
+        const ackBtn = document.getElementById('acknowledgeBtn');
+        if (alert.acknowledged) {
+            ackBtn.style.display = 'none';
+        } else {
+            ackBtn.style.display = 'block';
+            ackBtn.onclick = function() { acknowledgeAlert(alertId); };
+        }
+        
+        modal.show();
+    }
+
+    // Acknowledge single alert
+    function acknowledgeSingle(alertId) {
+        if (confirm('Mark this alert as acknowledged?')) {
+            acknowledgeAlert(alertId);
+        }
+    }
+
+    // Acknowledge alert
+    function acknowledgeAlert(alertId) {
+        fetch(`/api/alerts/${alertId}/acknowledge`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            }
+        })
+        .then(response => response.json())
+        .then(data => {
+            if (data.status === 'success') {
+                loadAlerts();
+                const modal = bootstrap.Modal.getInstance(document.getElementById('alertDetailModal'));
+                modal.hide();
+                showToast('Alert acknowledged successfully!', 'success');
+            }
+        })
+        .catch(error => {
+            showToast('Error acknowledging alert', 'danger');
+        });
+    }
+
+    // Acknowledge all pending alerts
+    function acknowledgeAll() {
+        if (!confirm('Acknowledge all pending alerts?')) return;
+        
+        const pendingAlerts = allAlerts.filter(a => !a.acknowledged);
+        let completed = 0;
+        
+        pendingAlerts.forEach(alert => {
+            fetch(`/api/alerts/${alert.id}/acknowledge`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                }
+            })
+            .then(() => {
+                completed++;
+                if (completed === pendingAlerts.length) {
+                    loadAlerts();
+                    showToast(`Acknowledged ${completed} alerts`, 'success');
+                }
+            });
+        });
+    }
+
+    // Update charts
+    function updateCharts() {
+        // Prepare data for line chart (last 7 days)
+        const days = [];
+        const counts = [];
+        const now = new Date();
+        
+        for (let i = 6; i >= 0; i--) {
+            const date = new Date(now);
+            date.setDate(date.getDate() - i);
+            const dateStr = date.toLocaleDateString([], {month: 'short', day: 'numeric'});
+            days.push(dateStr);
+            
+            const dayStart = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+            const dayEnd = new Date(dayStart.getTime() + 24 * 60 * 60 * 1000);
+            
+            const count = allAlerts.filter(alert => {
+                const alertDate = new Date(alert.timestamp);
+                return alertDate >= dayStart && alertDate < dayEnd;
+            }).length;
+            
+            counts.push(count);
+        }
+        
+        // Update line chart
+        const lineCtx = document.getElementById('alertChart').getContext('2d');
+        if (alertChart) alertChart.destroy();
+        
+        alertChart = new Chart(lineCtx, {
+            type: 'line',
+            data: {
+                labels: days,
+                datasets: [{
+                    label: 'Alerts per Day',
+                    data: counts,
+                    borderColor: '#e74c3c',
+                    backgroundColor: 'rgba(231, 76, 60, 0.1)',
+                    fill: true,
+                    tension: 0.4
+                }]
+            },
+            options: {
+                responsive: true,
+                plugins: {
+                    legend: {
+                        display: true
+                    }
+                },
+                scales: {
+                    y: {
+                        beginAtZero: true,
+                        ticks: {
+                            stepSize: 1
+                        }
+                    }
+                }
+            }
+        });
+        
+        // Prepare data for pie chart
+        const types = {};
+        allAlerts.forEach(alert => {
+            const type = alert.alert_type.split(',')[0] || 'other';
+            types[type] = (types[type] || 0) + 1;
+        });
+        
+        const pieLabels = Object.keys(types);
+        const pieData = Object.values(types);
+        const pieColors = ['#e74c3c', '#f39c12', '#3498db', '#2ecc71', '#9b59b6'];
+        
+        // Update pie chart
+        const pieCtx = document.getElementById('alertPieChart').getContext('2d');
+        if (pieChart) pieChart.destroy();
+        
+        pieChart = new Chart(pieCtx, {
+            type: 'pie',
+            data: {
+                labels: pieLabels,
+                datasets: [{
+                    data: pieData,
+                    backgroundColor: pieColors
+                }]
+            },
+            options: {
+                responsive: true,
+                plugins: {
+                    legend: {
+                        position: 'bottom'
+                    }
+                }
+            }
+        });
+    }
+
+    // Refresh alerts
+    function refreshAlerts() {
+        loadAlerts();
+        showToast('Alerts refreshed', 'info');
+    }
+
+    // Show toast notification
+    function showToast(message, type = 'info') {
+        // Create toast container if it doesn't exist
+        let toastContainer = document.getElementById('toastContainer');
+        if (!toastContainer) {
+            toastContainer = document.createElement('div');
+            toastContainer.id = 'toastContainer';
+            toastContainer.style.cssText = `
+                position: fixed;
+                top: 20px;
+                right: 20px;
+                z-index: 9999;
+            `;
+            document.body.appendChild(toastContainer);
+        }
+        
+        // Create toast
+        const toastId = 'toast-' + Date.now();
+        const toast = document.createElement('div');
+        toast.id = toastId;
+        toast.className = `alert alert-${type} alert-dismissible fade show`;
+        toast.innerHTML = `
+            ${message}
+            <button type="button" class="btn-close" onclick="document.getElementById('${toastId}').remove()"></button>
+        `;
+        toast.style.cssText = `
+            margin-bottom: 10px;
+            min-width: 250px;
+        `;
+        
+        toastContainer.appendChild(toast);
+        
+        // Auto remove after 3 seconds
+        setTimeout(() => {
+            if (document.getElementById(toastId)) {
+                document.getElementById(toastId).remove();
+            }
+        }, 3000);
+    }
+
+    // Add CSS for alert rows
+    const style = document.createElement('style');
+    style.textContent = `
+        .alert-row {
+            animation: pulse 2s infinite;
+        }
+        .alert-row:hover {
+            background-color: rgba(231, 76, 60, 0.1) !important;
+        }
+        @keyframes pulse {
+            0% { box-shadow: inset 0 0 0 0 rgba(231, 76, 60, 0.1); }
+            50% { box-shadow: inset 0 0 0 10px rgba(231, 76, 60, 0); }
+            100% { box-shadow: inset 0 0 0 0 rgba(231, 76, 60, 0.1); }
+        }
+    `;
+    document.head.appendChild(style);
+</script>
+{% endblock %}
+'''
+
+# ESP32 Arduino code as string
+ESP32_CODE = '''
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+
+// ========= CONFIGURATION =========
+const char* ssid = "Varun";
+const char* password = "VARUN0430";
+const char* serverUrl = "http://YOUR_SERVER_IP:5000/api/helmet/data";
+
+// Worker and Helmet IDs
+const String WORKER_ID = "WKR001";
+const String HELMET_ID = "HLM001";
+
+// -------- PINS --------
+#define GAS_PIN      34
+#define TEMP_PIN     35
+#define IR_PIN       15
+#define BUZZER_PIN   26
+#define SOS_PIN      4
+#define BATTERY_PIN  36
+
+// -------- THRESHOLDS --------
+#define GAS_THRESHOLD    2700
+#define TEMP_THRESHOLD   40.0
+#define FALL_THRESHOLD   2700
+
+// -------- VARIABLES --------
+unsigned long lastSendTime = 0;
+const unsigned long SEND_INTERVAL = 5000; // 5 seconds
+
+bool buzzerState = false;
+unsigned long buzzerStartTime = 0;
+const unsigned long BUZZER_DURATION = 3000; // 3 seconds
+
+// -------- ACCELEROMETER --------
+int lastX = 0, lastY = 0, lastZ = 0;
+int xVal, yVal, zVal;
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(115200);
+  
+  // Initialize pins
+  pinMode(IR_PIN, INPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(SOS_PIN, INPUT_PULLUP);
+  
+  digitalWrite(BUZZER_PIN, LOW);
+  
+  Serial.println("Smart Safety Helmet - ESP32");
+  
+  // Connect to WiFi
+  connectToWiFi();
+  
+  // Initial sensor readings
+  readAccelerometer();
+  lastX = xVal;
+  lastY = yVal;
+  lastZ = zVal;
+}
+
+void connectToWiFi() {
+  Serial.print("Connecting to WiFi");
+  WiFi.begin(ssid, password);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi Connected!");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\nFailed to connect to WiFi");
+  }
+}
+
+// ================= SENSOR FUNCTIONS =================
+float readTemperature() {
+  int rawTemp = analogRead(TEMP_PIN);
+  float voltage = rawTemp * (3.3 / 4095.0);
+  float temperature = (voltage - 0.5) * 100.0;
+  return temperature;
+}
+
+int readGas() {
+  return analogRead(GAS_PIN);
+}
+
+void readAccelerometer() {
+  xVal = analogRead(32);
+  yVal = analogRead(33);
+  zVal = analogRead(25);
+}
+
+bool detectFall() {
+  readAccelerometer();
+  
+  // Calculate change in acceleration
+  int deltaX = abs(xVal - lastX);
+  int deltaY = abs(yVal - lastY);
+  int deltaZ = abs(zVal - lastZ);
+  
+  // Update last values
+  lastX = xVal;
+  lastY = yVal;
+  lastZ = zVal;
+  
+  // Detect sudden change (fall)
+  if (deltaX > FALL_THRESHOLD || deltaY > FALL_THRESHOLD || deltaZ > FALL_THRESHOLD) {
+    return true;
+  }
+  
+  return false;
+}
+
+bool isHelmetWorn() {
+  return digitalRead(IR_PIN) == LOW;
+}
+
+float readBattery() {
+  int raw = analogRead(BATTERY_PIN);
+  float voltage = raw * (3.3 / 4095.0);
+  return voltage * 2.0; // Voltage divider
+}
+
+bool isSOSPressed() {
+  return digitalRead(SOS_PIN) == LOW;
+}
+
+// ================= BUZZER CONTROL =================
+void controlBuzzer(bool state) {
+  if (state && !buzzerState) {
+    buzzerState = true;
+    buzzerStartTime = millis();
+    digitalWrite(BUZZER_PIN, HIGH);
+  } else if (!state && buzzerState) {
+    buzzerState = false;
+    digitalWrite(BUZZER_PIN, LOW);
+  }
+  
+  // Auto-off after duration
+  if (buzzerState && (millis() - buzzerStartTime > BUZZER_DURATION)) {
+    controlBuzzer(false);
+  }
+}
+
+// ================= SEND DATA TO SERVER =================
+void sendSensorData() {
+  if (WiFi.status() != WL_CONNECTED) {
+    connectToWiFi();
+    return;
+  }
+  
+  // Read sensors
+  float temperature = readTemperature();
+  int gas = readGas();
+  bool helmetWorn = isHelmetWorn();
+  bool fall = detectFall();
+  bool sos = isSOSPressed();
+  float battery = readBattery();
+  
+  // Create JSON payload
+  DynamicJsonDocument doc(512);
+  doc["worker_id"] = WORKER_ID;
+  doc["helmet_id"] = HELMET_ID;
+  doc["helmet_worn"] = helmetWorn;
+  doc["gas"] = gas;
+  doc["temperature"] = temperature;
+  doc["fall"] = fall || sos; // Treat SOS as fall emergency
+  doc["battery"] = battery;
+  doc["timestamp"] = millis();
+  
+  String payload;
+  serializeJson(doc, payload);
+  
+  Serial.println("Sending data: " + payload);
+  
+  // Send HTTP POST
+  HTTPClient http;
+  http.begin(serverUrl);
+  http.addHeader("Content-Type", "application/json");
+  
+  int httpCode = http.POST(payload);
+  
+  if (httpCode > 0) {
+    String response = http.getString();
+    Serial.println("Response: " + response);
+    
+    // Parse response for buzzer control
+    DynamicJsonDocument respDoc(256);
+    DeserializationError error = deserializeJson(respDoc, response);
+    
+    if (!error) {
+      String buzzerCmd = respDoc["buzzer"];
+      if (buzzerCmd == "ON") {
+        controlBuzzer(true);
+      } else {
+        controlBuzzer(false);
+      }
+      
+      // Print risk info
+      Serial.print("Risk Score: ");
+      Serial.println(respDoc["risk_score"].as<int>());
+      Serial.print("Risk Level: ");
+      Serial.println(respDoc["risk_level"].as<String>());
+    }
+  } else {
+    Serial.println("HTTP Error: " + String(httpCode));
+  }
+  
+  http.end();
+}
+
+// ================= LOOP =================
+void loop() {
+  // Check SOS button
+  if (isSOSPressed()) {
+    Serial.println("SOS BUTTON PRESSED!");
+    controlBuzzer(true);
+    delay(1000); // Immediate response
+  }
+  
+  // Send data at regular intervals
+  if (millis() - lastSendTime > SEND_INTERVAL) {
+    sendSensorData();
+    lastSendTime = millis();
+  }
+  
+  // Check local thresholds for immediate response
+  float temp = readTemperature();
+  int gasVal = readGas();
+  
+  if (temp > TEMP_THRESHOLD || gasVal > GAS_THRESHOLD) {
+    controlBuzzer(true);
+  }
+  
+  delay(100);
+}
+'''
+
+# Requirements.txt as string
+REQUIREMENTS_TXT = '''Flask==2.3.3
+Flask-SQLAlchemy==3.0.5
+Flask-JWT-Extended==4.5.2
+Flask-CORS==4.0.0
+Werkzeug==2.3.7
+requests==2.31.0
+python-dotenv==1.0.0
+'''
+
+# ============================ HELPER CLASSES ============================
+class RiskEngine:
+    @staticmethod
+    def calculate_risk(data):
+        risk_score = 0
+        alerts = []
+        
+        # Gas risk
+        if data['gas'] > Config.GAS_THRESHOLD:
+            risk_score += 30
+            alerts.append('High gas concentration detected')
+        
+        # Temperature risk
+        if data['temperature'] > Config.TEMP_THRESHOLD:
+            risk_score += 25
+            alerts.append(f'High temperature: {data["temperature"]}°C')
+        
+        # Helmet not worn
+        if not data['helmet_worn']:
+            risk_score += 20
+            alerts.append('Helmet not worn')
+        
+        # Fall detected
+        if data['fall']:
+            risk_score += 25
+            alerts.append('Fall detected')
+        
+        return min(risk_score, 100), alerts
+    
+    @staticmethod
+    def get_risk_level(score):
+        if score <= Config.RISK_SAFE:
+            return 'safe', 'green'
+        elif score <= Config.RISK_WARNING:
+            return 'warning', 'orange'
+        else:
+            return 'danger', 'red'
+
+class WorkSessionTracker:
+    @staticmethod
+    def handle_helmet_status(worker_id, helmet_worn):
+        conn = sqlite3.connect('safety_helmet.db')
+        c = conn.cursor()
+        now = datetime.now()
+        
+        c.execute("SELECT id, start_time FROM work_sessions WHERE worker_id = ? AND is_completed = 0 ORDER BY id DESC LIMIT 1", (worker_id,))
+        session = c.fetchone()
+        
+        if helmet_worn:
+            if not session:
+                # Start new session
+                c.execute("INSERT INTO work_sessions (worker_id, start_time, is_completed) VALUES (?, ?, ?)",
+                         (worker_id, now, 0))
+        else:
+            if session:
+                # End existing session
+                session_id, start_time = session
+                if isinstance(start_time, str):
+                    start_time = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
+                duration = int((now - start_time).total_seconds())
+                c.execute("UPDATE work_sessions SET end_time = ?, duration = ?, is_completed = 1 WHERE id = ?",
+                         (now, duration, session_id))
+        
+        conn.commit()
+        conn.close()
+    
+    @staticmethod
+    def get_worker_hours(worker_id, period='today'):
+        conn = sqlite3.connect('safety_helmet.db')
+        c = conn.cursor()
+        now = datetime.now()
+        
+        if period == 'today':
+            start_date = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            c.execute("SELECT SUM(duration) FROM work_sessions WHERE worker_id = ? AND start_time >= ? AND is_completed = 1", 
+                     (worker_id, start_date))
+        elif period == 'week':
+            start_date = now - timedelta(days=7)
+            c.execute("SELECT SUM(duration) FROM work_sessions WHERE worker_id = ? AND start_time >= ? AND is_completed = 1", 
+                     (worker_id, start_date))
+        else:  # month
+            start_date = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            c.execute("SELECT SUM(duration) FROM work_sessions WHERE worker_id = ? AND start_time >= ? AND is_completed = 1", 
+                     (worker_id, start_date))
+        
+        result = c.fetchone()
+        total_seconds = result[0] or 0
+        
+        # Check for active session
+        c.execute("SELECT start_time FROM work_sessions WHERE worker_id = ? AND is_completed = 0 ORDER BY id DESC LIMIT 1", (worker_id,))
+        active_session = c.fetchone()
+        
+        if active_session:
+            start_time = active_session[0]
+            if isinstance(start_time, str):
+                start_time = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
+            current_duration = (now - start_time).total_seconds()
+            total_seconds += current_duration
+        
+        conn.close()
+        hours = total_seconds / 3600
+        return round(hours, 2)
+
+class AlertSystem:
+    @staticmethod
+    def send_telegram_alert(chat_id, message):
+        # Placeholder for Telegram integration
+        print(f"Telegram Alert to {chat_id}: {message}")
+        return True
+    
+    @staticmethod
+    def create_alert(worker_id, helmet_id, risk_score, alerts_list):
+        conn = sqlite3.connect('safety_helmet.db')
+        c = conn.cursor()
+        
+        # Get worker info
+        c.execute("SELECT name FROM workers WHERE worker_id = ?", (worker_id,))
+        worker = c.fetchone()
+        worker_name = worker[0] if worker else "Unknown"
+        
+        # Create alert record
+        alert_type = ','.join([a.split(':')[0] for a in alerts_list]) if alerts_list else 'general'
+        message = '; '.join(alerts_list) if alerts_list else 'Risk alert triggered'
+        
+        c.execute("""INSERT INTO alerts (worker_id, helmet_id, alert_type, risk_score, message, timestamp, acknowledged) 
+                     VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                 (worker_id, helmet_id, alert_type, risk_score, message, datetime.now(), 0))
+        
+        conn.commit()
+        
+        # Send Telegram alerts
+        alert_message = f"🚨 SAFETY ALERT 🚨\nWorker: {worker_name}\nID: {worker_id}\nRisk Score: {risk_score}\nAlerts: {message}"
+        
+        # Send to manager
+        c.execute("SELECT telegram_id FROM users WHERE role = 'manager' LIMIT 1")
+        manager = c.fetchone()
+        if manager and manager[0]:
+            AlertSystem.send_telegram_alert(manager[0], alert_message)
+        
+        # Send to worker
+        c.execute("SELECT telegram_id FROM users WHERE worker_id = ?", (worker_id,))
+        worker_user = c.fetchone()
+        if worker_user and worker_user[0]:
+            AlertSystem.send_telegram_alert(worker_user[0], alert_message)
+        
+        conn.close()
+
+# ============================ FLASK APPLICATION ============================
+app = Flask(__name__)
+app.config.from_object(Config)
+app.secret_key = Config.SECRET_KEY
+CORS(app)
+jwt = JWTManager(app)
+
+# Initialize database
+init_db()
+
+# ============================ UTILITY FUNCTIONS ============================
+def get_db_connection():
+    conn = sqlite3.connect('safety_helmet.db')
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def role_required(role):
+    def decorator(f):
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            if 'username' not in session:
+                return redirect(url_for('login'))
+            
+            if session.get('role') != role:
+                flash('Unauthorized access', 'error')
+                return redirect(url_for('dashboard'))
+            
+            return f(*args, **kwargs)
+        return decorated_function
+    return decorator
+
+def get_time_ago(timestamp):
+    if isinstance(timestamp, str):
+        timestamp = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+    
+    now = datetime.now()
+    diff = now - timestamp
+    
+    if diff.days > 0:
+        return f"{diff.days} days ago"
+    elif diff.seconds > 3600:
+        hours = diff.seconds // 3600
+        return f"{hours} hours ago"
+    elif diff.seconds > 60:
+        minutes = diff.seconds // 60
+        return f"{minutes} minutes ago"
+    else:
+        return "Just now"
+
+# ============================ ROUTES ============================
+@app.route('/')
+def index():
+    return redirect(url_for('login'))
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form.get('username')
+        password = request.form.get('password')
+        
+        conn = get_db_connection()
+        user = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+        conn.close()
+        
+        if user and check_password_hash(user['password_hash'], password):
+            session['user_id'] = user['id']
+            session['username'] = user['username']
+            session['role'] = user['role']
+            session['worker_id'] = user['worker_id']
+            
+            # Create access token
+            access_token = create_access_token(identity=username)
+            response = redirect(url_for('dashboard'))
+            response.set_cookie('access_token', access_token)
+            
+            return response
+        else:
+            flash('Invalid credentials', 'error')
+    
+    return render_template('login.html')
+
+@app.route('/dashboard')
+def dashboard():
+    if 'username' not in session:
+        return redirect(url_for('login'))
+    
+    if session['role'] == 'worker':
+        return redirect(url_for('worker_dashboard'))
+    else:
+        return redirect(url_for('manager_dashboard'))
+
+@app.route('/worker/dashboard')
+@role_required('worker')
+def worker_dashboard():
+    conn = get_db_connection()
+    
+    # Get worker info
+    worker = conn.execute("SELECT * FROM workers WHERE worker_id = ?", (session['worker_id'],)).fetchone()
+    
+    # Get latest log
+    latest_log = conn.execute("SELECT * FROM helmet_logs WHERE worker_id = ? ORDER BY timestamp DESC LIMIT 1", 
+                             (session['worker_id'],)).fetchone()
+    
+    # Get today's hours
+    today_hours = WorkSessionTracker.get_worker_hours(session['worker_id'], 'today')
+    
+    # Get recent alerts
+    recent_alerts = conn.execute("SELECT * FROM alerts WHERE worker_id = ? ORDER BY timestamp DESC LIMIT 5", 
+                                (session['worker_id'],)).fetchall()
+    
+    conn.close()
+    
+    return render_template('worker_dashboard.html',
+                         worker=worker,
+                         latest_log=latest_log,
+                         today_hours=today_hours,
+                         recent_alerts=recent_alerts)
+
+@app.route('/manager/dashboard')
+@role_required('manager')
+def manager_dashboard():
+    conn = get_db_connection()
+    
+    # Get all workers
+    workers_data = []
+    workers = conn.execute("SELECT * FROM workers").fetchall()
+    
+    for worker in workers:
+        # Get latest log for each worker
+        latest_log = conn.execute("SELECT * FROM helmet_logs WHERE worker_id = ? ORDER BY timestamp DESC LIMIT 1", 
+                                 (worker['worker_id'],)).fetchone()
+        
+        if latest_log and latest_log['helmet_worn']:
+            risk_level = RiskEngine.get_risk_level(latest_log['risk_score'])[0]
+            is_active = True
+            last_update = latest_log['timestamp']
+            risk_score = latest_log['risk_score']
+        else:
+            risk_level = 'inactive'
+            is_active = False
+            last_update = None
+            risk_score = 0
+        
+        # Get today's hours
+        today_hours = WorkSessionTracker.get_worker_hours(worker['worker_id'], 'today')
+        
+        workers_data.append({
+            'worker_id': worker['worker_id'],
+            'name': worker['name'],
+            'department': worker['department'],
+            'helmet_id': worker['helmet_id'],
+            'risk_score': risk_score,
+            'risk_level': risk_level,
+            'last_update': last_update,
+            'is_active': is_active,
+            'today_hours': today_hours
+        })
+    
+    # Get unacknowledged alerts
+    alerts = conn.execute("""
+        SELECT a.*, w.name as worker_name 
+        FROM alerts a 
+        LEFT JOIN workers w ON a.worker_id = w.worker_id 
+        WHERE a.acknowledged = 0 
+        ORDER BY a.timestamp DESC 
+        LIMIT 10
+    """).fetchall()
+    
+    conn.close()
+    
+    return render_template('manager_dashboard.html',
+                         workers=workers_data,
+                         alerts=alerts)
+
+@app.route('/reports')
+@role_required('manager')
+def reports_page():
+    return render_template('reports.html', today=datetime.now().strftime('%Y-%m-%d'))
+
+@app.route('/alerts')
+@role_required('manager')
+def alerts_page():
+    return render_template('alerts.html')
+
+@app.route('/api/helmet/data', methods=['POST'])
+def receive_helmet_data():
+    try:
+        data = request.get_json()
+        
+        # Validate required fields
+        required_fields = ['worker_id', 'helmet_id', 'helmet_worn', 'gas', 'temperature', 'fall']
+        for field in required_fields:
+            if field not in data:
+                return jsonify({'error': f'Missing field: {field}'}), 400
+        
+        # Convert types
+        worker_id = str(data['worker_id'])
+        helmet_id = str(data['helmet_id'])
+        helmet_worn = bool(data['helmet_worn'])
+        gas = int(data['gas'])
+        temperature = float(data['temperature'])
+        fall = bool(data['fall'])
+        battery = float(data.get('battery', 0.0))
+        
+        # Calculate risk score
+        risk_score, alerts = RiskEngine.calculate_risk({
+            'gas': gas,
+            'temperature': temperature,
+            'helmet_worn': helmet_worn,
+            'fall': fall
+        })
+        
+        # Create helmet log
+        conn = get_db_connection()
+        conn.execute("""
+            INSERT INTO helmet_logs (worker_id, helmet_id, gas, temperature, helmet_worn, fall, risk_score, battery, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (worker_id, helmet_id, gas, temperature, helmet_worn, fall, risk_score, battery, datetime.now()))
+        
+        # Update worker active status
+        conn.execute("UPDATE workers SET is_active = ? WHERE worker_id = ?", (1 if helmet_worn else 0, worker_id))
+        
+        conn.commit()
+        conn.close()
+        
+        # Handle work session tracking
+        WorkSessionTracker.handle_helmet_status(worker_id, helmet_worn)
+        
+        # Check for alerts
+        if risk_score >= Config.RISK_WARNING and alerts:
+            AlertSystem.create_alert(worker_id, helmet_id, risk_score, alerts)
+        
+        # Determine buzzer status
+        buzzer_status = "ON" if risk_score >= Config.RISK_WARNING else "OFF"
+        
+        return jsonify({
+            'status': 'success',
+            'risk_score': risk_score,
+            'risk_level': RiskEngine.get_risk_level(risk_score)[0],
+            'buzzer': buzzer_status
+        }), 200
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/worker/status')
+@role_required('worker')
+def get_worker_status():
+    conn = get_db_connection()
+    
+    # Get latest log
+    latest_log = conn.execute("SELECT * FROM helmet_logs WHERE worker_id = ? ORDER BY timestamp DESC LIMIT 1", 
+                             (session['worker_id'],)).fetchone()
+    
+    conn.close()
+    
+    if not latest_log:
+        return jsonify({
+            'status': 'offline',
+            'message': 'No helmet data available'
+        }), 200
+    
+    risk_level, color = RiskEngine.get_risk_level(latest_log['risk_score'])
+    
+    return jsonify({
+        'worker_id': session['worker_id'],
+        'helmet_worn': bool(latest_log['helmet_worn']),
+        'gas': latest_log['gas'],
+        'temperature': latest_log['temperature'],
+        'fall': bool(latest_log['fall']),
+        'risk_score': latest_log['risk_score'],
+        'risk_level': risk_level,
+        'battery': latest_log['battery'],
+        'last_update': latest_log['timestamp'],
+        'today_hours': WorkSessionTracker.get_worker_hours(session['worker_id'], 'today')
+    })
+
+@app.route('/api/manager/workers')
+@role_required('manager')
+def get_all_workers():
+    conn = get_db_connection()
+    
+    workers = conn.execute("SELECT * FROM workers").fetchall()
+    result = []
+    
+    for worker in workers:
+        latest_log = conn.execute("SELECT * FROM helmet_logs WHERE worker_id = ? ORDER BY timestamp DESC LIMIT 1", 
+                                 (worker['worker_id'],)).fetchone()
+        
+        worker_data = {
+            'worker_id': worker['worker_id'],
+            'name': worker['name'],
+            'department': worker['department'],
+            'helmet_id': worker['helmet_id'],
+            'is_active': bool(worker['is_active'])
+        }
+        
+        if latest_log:
+            risk_level, color = RiskEngine.get_risk_level(latest_log['risk_score'])
+            worker_data.update({
+                'gas': latest_log['gas'],
+                'temperature': latest_log['temperature'],
+                'helmet_worn': bool(latest_log['helmet_worn']),
+                'risk_score': latest_log['risk_score'],
+                'risk_level': risk_level,
+                'last_update': latest_log['timestamp'],
+                'today_hours': WorkSessionTracker.get_worker_hours(worker['worker_id'], 'today'),
+                'week_hours': WorkSessionTracker.get_worker_hours(worker['worker_id'], 'week'),
+                'month_hours': WorkSessionTracker.get_worker_hours(worker['worker_id'], 'month')
+            })
+        
+        result.append(worker_data)
+    
+    conn.close()
+    return jsonify(result)
+
+@app.route('/api/alerts')
+def get_alerts():
+    conn = get_db_connection()
+    
+    if session.get('role') == 'worker':
+        alerts = conn.execute("""
+            SELECT a.*, w.name as worker_name 
+            FROM alerts a 
+            LEFT JOIN workers w ON a.worker_id = w.worker_id 
+            WHERE a.worker_id = ? 
+            ORDER BY a.timestamp DESC 
+            LIMIT 50
+        """, (session.get('worker_id'),)).fetchall()
+    else:
+        alerts = conn.execute("""
+            SELECT a.*, w.name as worker_name 
+            FROM alerts a 
+            LEFT JOIN workers w ON a.worker_id = w.worker_id 
+            ORDER BY a.timestamp DESC 
+            LIMIT 100
+        """).fetchall()
+    
+    result = []
+    for alert in alerts:
+        result.append({
+            'id': alert['id'],
+            'worker_name': alert['worker_name'],
+            'worker_id': alert['worker_id'],
+            'alert_type': alert['alert_type'],
+            'risk_score': alert['risk_score'],
+            'message': alert['message'],
+            'timestamp': alert['timestamp'],
+            'acknowledged': bool(alert['acknowledged']),
+            'acknowledged_by': alert['acknowledged_by'],
+            'time_ago': get_time_ago(alert['timestamp'])
+        })
+    
+    conn.close()
+    return jsonify(result)
+
+@app.route('/api/alerts/<int:alert_id>/acknowledge', methods=['POST'])
+@role_required('manager')
+def acknowledge_alert(alert_id):
+    conn = get_db_connection()
+    
+    conn.execute("""
+        UPDATE alerts 
+        SET acknowledged = 1, acknowledged_by = ?, acknowledged_at = ? 
+        WHERE id = ?
+    """, (session['username'], datetime.now(), alert_id))
+    
+    conn.commit()
+    conn.close()
+    
+    return jsonify({'status': 'success'})
+
+@app.route('/api/reports/daily')
+@role_required('manager')
+def get_daily_report():
+    today = datetime.now().date()
+    start_date = datetime.combine(today, datetime.min.time())
+    end_date = datetime.combine(today, datetime.max.time())
+    
+    conn = get_db_connection()
+    
+    # Get all logs for today
+    logs = conn.execute("SELECT * FROM helmet_logs WHERE timestamp BETWEEN ? AND ?", 
+                       (start_date, end_date)).fetchall()
+    
+    # Get all sessions for today
+    sessions = conn.execute("SELECT * FROM work_sessions WHERE start_time BETWEEN ? AND ? AND is_completed = 1", 
+                           (start_date, end_date)).fetchall()
+    
+    # Get all alerts for today
+    alerts = conn.execute("SELECT * FROM alerts WHERE timestamp BETWEEN ? AND ?", 
+                         (start_date, end_date)).fetchall()
+    
+    conn.close()
+    
+    report = {
+        'date': today.isoformat(),
+        'total_workers': len([w for w in logs]),
+        'active_workers': len([l for l in logs if l['helmet_worn']]),
+        'high_risk_incidents': len([l for l in logs if l['risk_score'] >= Config.RISK_WARNING]),
+        'total_alerts': len(alerts),
+        'total_work_hours': sum(s['duration'] for s in sessions if s['duration']) / 3600 if sessions else 0,
+        'average_risk_score': sum(l['risk_score'] for l in logs) / len(logs) if logs else 0
+    }
+    
+    return jsonify(report)
+
+@app.route('/api/worker/sos', methods=['POST'])
+@role_required('worker')
+def send_sos():
+    try:
+        conn = get_db_connection()
+        
+        # Get worker info
+        worker = conn.execute("SELECT * FROM workers WHERE worker_id = ?", (session['worker_id'],)).fetchone()
+        
+        # Create SOS alert
+        conn.execute("""
+            INSERT INTO alerts (worker_id, helmet_id, alert_type, risk_score, message, timestamp, acknowledged)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (session['worker_id'], worker['helmet_id'], 'sos', 100, 'EMERGENCY SOS ALERT - Worker needs immediate assistance!', datetime.now(), 0))
+        
+        conn.commit()
+        conn.close()
+        
+        # Send Telegram alert
+        alert_message = f"🚨 EMERGENCY SOS ALERT 🚨\nWorker: {worker['name']}\nID: {session['worker_id']}\nLocation: Unknown\nTime: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        
+        # Send to manager
+        conn = get_db_connection()
+        manager = conn.execute("SELECT telegram_id FROM users WHERE role = 'manager' LIMIT 1").fetchone()
+        if manager and manager['telegram_id']:
+            AlertSystem.send_telegram_alert(manager['telegram_id'], alert_message)
+        conn.close()
+        
+        return jsonify({'status': 'success', 'message': 'SOS alert sent successfully!'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    response = redirect(url_for('login'))
+    response.delete_cookie('access_token')
+    return response
+
+# ============================ RENDER TEMPLATE HELPERS ============================
+@app.context_processor
+def utility_processor():
+    def datetime_format(value, format='%H:%M:%S'):
+        if isinstance(value, str):
+            value = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        return value.strftime(format)
+    
+    def date_format(value, format='%Y-%m-%d'):
+        if isinstance(value, str):
+            value = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        return value.strftime(format)
+    
+    return dict(datetime_format=datetime_format, date_format=date_format)
+
+# Custom template rendering
+def render_template(template_name, **context):
+    templates = {
+        'base.html': BASE_TEMPLATE,
+        'login.html': LOGIN_TEMPLATE,
+        'worker_dashboard.html': WORKER_DASHBOARD_TEMPLATE,
+        'manager_dashboard.html': MANAGER_DASHBOARD_TEMPLATE,
+        'reports.html': REPORTS_TEMPLATE,
+        'alerts.html': ALERTS_TEMPLATE
+    }
+    
+    if template_name not in templates:
+        return "Template not found", 404
+    
+    # Render the template using Jinja2
+    from jinja2 import Environment, BaseLoader, TemplateNotFound
+    
+    env = Environment(loader=BaseLoader())
+    
+    # Register custom filters
+    env.filters['datetime_format'] = utility_processor()['datetime_format']
+    env.filters['date_format'] = utility_processor()['date_format']
+    
+    # Create a template that extends base.html
+    template_content = templates[template_name]
+    
+    # For child templates, we need to handle the extends directive
+    if '{% extends' in template_content:
+        # Get the base template name from the extends directive
+        import re
+        match = re.search(r'{% extends "([^"]+)" %}', template_content)
+        if match:
+            base_template_name = match.group(1)
+            if base_template_name in templates:
+                # Replace the extends with the actual base template content
+                base_content = templates[base_template_name]
+                # Remove the extends directive and render blocks
+                template_content = template_content.replace(match.group(0), '')
+                # For simplicity, we'll just render the child template directly
+                # In a real implementation, you'd need a proper template inheritance system
+    
+    template = env.from_string(template_content)
+    return template.render(**context, session=session, request=request)
+
+# ============================ MAIN EXECUTION ============================
+if __name__ == '__main__':
+    print("Initializing Smart Safety Helmet System...")
+    print("Database initialized with sample data")
+    print("Starting Flask server on http://0.0.0.0:5000")
+    print("Wifi Credentials: SSID='Varun', Password='VARUN0430'")
+    print("\nAccess the system at:")
+    print("  - Login: http://localhost:5000/login")
+    print("  - Manager Dashboard: http://localhost:5000/manager/dashboard")
+    print("  - Worker Dashboard: http://localhost:5000/worker/dashboard")
+    print("\nDefault credentials:")
+    print("  - Manager: manager / manager123")
+    print("  - Worker: worker001 / worker123")
+    
+    app.run(host='0.0.0.0', port=5000, debug=True)
