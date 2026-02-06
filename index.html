@@ -1,138 +1,6 @@
-"""
-Smart Safety Helmet System
-Complete integrated codebase - All files combined into one
-"""
-
-# ============================ IMPORTS ============================
-from flask import Flask, render_template, jsonify, request, redirect, url_for, flash, Response, session
-from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity, decode_token
-from flask_cors import CORS
-from werkzeug.security import generate_password_hash, check_password_hash
-from datetime import datetime, timedelta
-import json
-import requests
-import os
-from functools import wraps
-import sqlite3
-from contextlib import closing
-
-# ============================ CONFIGURATION ============================
-class Config:
-    SECRET_KEY = os.environ.get('SECRET_KEY') or 'smart-safety-helmet-secret-key-2024'
-    SQLALCHEMY_DATABASE_URI = 'sqlite:///safety_helmet.db'
-    SQLALCHEMY_TRACK_MODIFICATIONS = False
-    JWT_SECRET_KEY = 'jwt-smart-safety-helmet-secret'
-    JWT_ACCESS_TOKEN_EXPIRES = timedelta(hours=24)
-    
-    # Risk thresholds
-    GAS_THRESHOLD = 2700
-    TEMP_THRESHOLD = 40
-    RISK_SAFE = 30
-    RISK_WARNING = 60
-    RISK_DANGER = 100
-    
-    # Telegram Bot Config
-    TELEGRAM_BOT_TOKEN = 'YOUR_BOT_TOKEN'
-    MANAGER_CHAT_ID = 'MANAGER_CHAT_ID'
-
-# ============================ DATABASE MODELS ============================
-# We'll use SQLite directly for simplicity
-def init_db():
-    """Initialize the database with required tables"""
-    conn = sqlite3.connect('safety_helmet.db')
-    c = conn.cursor()
-    
-    # Users table
-    c.execute('''CREATE TABLE IF NOT EXISTS users
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  username TEXT UNIQUE NOT NULL,
-                  password_hash TEXT NOT NULL,
-                  role TEXT NOT NULL,
-                  worker_id TEXT,
-                  telegram_id TEXT,
-                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
-    
-    # Workers table
-    c.execute('''CREATE TABLE IF NOT EXISTS workers
-                 (worker_id TEXT PRIMARY KEY,
-                  name TEXT NOT NULL,
-                  helmet_id TEXT NOT NULL,
-                  department TEXT NOT NULL,
-                  phone TEXT,
-                  is_active BOOLEAN DEFAULT 0,
-                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
-    
-    # Helmet logs table
-    c.execute('''CREATE TABLE IF NOT EXISTS helmet_logs
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  worker_id TEXT NOT NULL,
-                  helmet_id TEXT NOT NULL,
-                  gas INTEGER NOT NULL,
-                  temperature REAL NOT NULL,
-                  helmet_worn BOOLEAN NOT NULL,
-                  fall BOOLEAN NOT NULL,
-                  risk_score INTEGER NOT NULL,
-                  battery REAL,
-                  timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                  FOREIGN KEY (worker_id) REFERENCES workers (worker_id))''')
-    
-    # Work sessions table
-    c.execute('''CREATE TABLE IF NOT EXISTS work_sessions
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  worker_id TEXT NOT NULL,
-                  start_time TIMESTAMP NOT NULL,
-                  end_time TIMESTAMP,
-                  duration INTEGER,
-                  is_completed BOOLEAN DEFAULT 0,
-                  FOREIGN KEY (worker_id) REFERENCES workers (worker_id))''')
-    
-    # Alerts table
-    c.execute('''CREATE TABLE IF NOT EXISTS alerts
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  worker_id TEXT NOT NULL,
-                  helmet_id TEXT NOT NULL,
-                  alert_type TEXT NOT NULL,
-                  risk_score INTEGER NOT NULL,
-                  message TEXT NOT NULL,
-                  timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                  acknowledged BOOLEAN DEFAULT 0,
-                  acknowledged_by TEXT,
-                  acknowledged_at TIMESTAMP,
-                  FOREIGN KEY (worker_id) REFERENCES workers (worker_id))''')
-    
-    # Create default manager account if not exists
-    c.execute("SELECT * FROM users WHERE username = 'manager'")
-    if not c.fetchone():
-        password_hash = generate_password_hash('manager123')
-        c.execute("INSERT INTO users (username, password_hash, role, telegram_id) VALUES (?, ?, ?, ?)",
-                  ('manager', password_hash, 'manager', Config.MANAGER_CHAT_ID))
-    
-    # Create sample workers for testing
-    sample_workers = [
-        ('WKR001', 'John Smith', 'HLM001', 'Construction', '+1234567890'),
-        ('WKR002', 'Emma Wilson', 'HLM002', 'Mining', '+1234567891'),
-        ('WKR003', 'David Lee', 'HLM003', 'Manufacturing', '+1234567892'),
-        ('WKR004', 'Sarah Johnson', 'HLM004', 'Warehouse', '+1234567893'),
-        ('WKR005', 'Michael Brown', 'HLM005', 'Construction', '+1234567894'),
-    ]
-    
-    for worker in sample_workers:
-        c.execute("SELECT * FROM workers WHERE worker_id = ?", (worker[0],))
-        if not c.fetchone():
-            c.execute("INSERT INTO workers (worker_id, name, helmet_id, department, phone) VALUES (?, ?, ?, ?, ?)", worker)
-            
-            # Create worker user account
-            username = f'worker{worker[0][-3:]}'
-            password_hash = generate_password_hash('worker123')
-            c.execute("INSERT INTO users (username, password_hash, role, worker_id, telegram_id) VALUES (?, ?, ?, ?, ?)",
-                      (username, password_hash, 'worker', worker[0], f'WORKER_{worker[0]}'))
-    
-    conn.commit()
-    conn.close()
-
-# ============================ HTML TEMPLATES ============================
-# Base template
-BASE_TEMPLATE = '''
+<!-- ============================ -->
+<!-- FILE: Base.html -->
+<!-- ============================ -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -147,6 +15,11 @@ BASE_TEMPLATE = '''
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
     
     <!-- Custom CSS -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    
+    <!-- Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    
     <style>
         :root {
             --primary-color: #2c3e50;
@@ -226,13 +99,6 @@ BASE_TEMPLATE = '''
         .risk-danger {
             background-color: var(--danger-color) !important;
             color: white;
-            animation: pulse 2s infinite;
-        }
-        
-        @keyframes pulse {
-            0% { box-shadow: 0 0 0 0 rgba(231, 76, 60, 0.4); }
-            70% { box-shadow: 0 0 0 10px rgba(231, 76, 60, 0); }
-            100% { box-shadow: 0 0 0 0 rgba(231, 76, 60, 0); }
         }
         
         .status-badge {
@@ -245,6 +111,12 @@ BASE_TEMPLATE = '''
         .alert-card {
             border-left: 5px solid var(--danger-color);
             animation: pulse 2s infinite;
+        }
+        
+        @keyframes pulse {
+            0% { box-shadow: 0 0 0 0 rgba(231, 76, 60, 0.4); }
+            70% { box-shadow: 0 0 0 10px rgba(231, 76, 60, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(231, 76, 60, 0); }
         }
         
         .real-time-indicator {
@@ -280,108 +152,7 @@ BASE_TEMPLATE = '''
                 margin-bottom: 15px;
             }
         }
-        
-        /* Additional styles from style.css */
-        .risk-indicator {
-            padding: 8px 20px;
-            border-radius: 20px;
-            font-weight: bold;
-            font-size: 0.9em;
-            display: inline-block;
-        }
-        
-        .status-active {
-            background: var(--safe-color);
-            color: white;
-        }
-        
-        .status-inactive {
-            background: #95a5a6;
-            color: white;
-        }
-        
-        .status-alert {
-            background: var(--danger-color);
-            color: white;
-            animation: blink 1s infinite;
-        }
-        
-        .progress {
-            height: 25px;
-            border-radius: 12px;
-            overflow: hidden;
-        }
-        
-        .progress-bar {
-            border-radius: 12px;
-            font-weight: 600;
-            line-height: 25px;
-        }
-        
-        .table th {
-            font-weight: 600;
-            color: var(--primary-color);
-            border-bottom-width: 2px;
-        }
-        
-        .table-hover tbody tr:hover {
-            background-color: rgba(52, 152, 219, 0.1);
-        }
-        
-        .btn {
-            border-radius: 8px;
-            font-weight: 600;
-            padding: 10px 20px;
-            transition: all 0.3s ease;
-        }
-        
-        .btn-primary {
-            background: linear-gradient(135deg, #3498db 0%, #2980b9 100%);
-            border: none;
-        }
-        
-        .btn:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.2);
-        }
-        
-        .sensor-value {
-            font-size: 2.5em;
-            font-weight: 700;
-            margin: 10px 0;
-        }
-        
-        .sensor-label {
-            color: #7f8c8d;
-            font-size: 0.9em;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-        }
-        
-        .chart-container {
-            position: relative;
-            height: 300px;
-            width: 100%;
-        }
-        
-        .loading-spinner {
-            border: 3px solid #f3f3f3;
-            border-top: 3px solid var(--secondary-color);
-            border-radius: 50%;
-            width: 40px;
-            height: 40px;
-            animation: spin 1s linear infinite;
-            margin: 20px auto;
-        }
-        
-        @keyframes spin {
-            0% { transform: rotate(0deg); }
-            100% { transform: rotate(360deg); }
-        }
     </style>
-    
-    <!-- Chart.js -->
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 <body>
     <!-- Navigation -->
@@ -414,11 +185,14 @@ BASE_TEMPLATE = '''
                 <a href="{{ url_for('worker_dashboard') }}" class="{% if request.endpoint == 'worker_dashboard' %}active{% endif %}">
                     <i class="fas fa-tachometer-alt"></i> Dashboard
                 </a>
-                <a href="{{ url_for('alerts_page') }}">
-                    <i class="fas fa-bell"></i> Alerts
+                <a href="#">
+                    <i class="fas fa-history"></i> My History
                 </a>
-                <a href="{{ url_for('reports_page') }}">
-                    <i class="fas fa-chart-bar"></i> Reports
+                <a href="#">
+                    <i class="fas fa-clock"></i> Working Hours
+                </a>
+                <a href="#">
+                    <i class="fas fa-bell"></i> Alerts
                 </a>
                 
                 {% elif session.role == 'manager' %}
@@ -426,11 +200,17 @@ BASE_TEMPLATE = '''
                 <a href="{{ url_for('manager_dashboard') }}" class="{% if request.endpoint == 'manager_dashboard' %}active{% endif %}">
                     <i class="fas fa-tachometer-alt"></i> Dashboard
                 </a>
-                <a href="{{ url_for('alerts_page') }}">
+                <a href="#">
+                    <i class="fas fa-users"></i> All Workers
+                </a>
+                <a href="#">
                     <i class="fas fa-exclamation-triangle"></i> Alerts
                 </a>
-                <a href="{{ url_for('reports_page') }}">
+                <a href="#">
                     <i class="fas fa-chart-bar"></i> Reports
+                </a>
+                <a href="#">
+                    <i class="fas fa-cog"></i> Settings
                 </a>
                 {% endif %}
             </div>
@@ -462,13 +242,16 @@ BASE_TEMPLATE = '''
     <!-- Bootstrap JS -->
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
     
+    <!-- Custom JS -->
+    <script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
+    
     {% block scripts %}{% endblock %}
 </body>
 </html>
-'''
 
-# Login template
-LOGIN_TEMPLATE = '''
+<!-- ============================ -->
+<!-- FILE: Login.html -->
+<!-- ============================ -->
 {% extends "base.html" %}
 
 {% block title %}Login{% endblock %}
@@ -536,10 +319,10 @@ LOGIN_TEMPLATE = '''
     </div>
 </div>
 {% endblock %}
-'''
 
-# Worker Dashboard template
-WORKER_DASHBOARD_TEMPLATE = '''
+<!-- ============================ -->
+<!-- FILE: Worker_dashboard.html -->
+<!-- ============================ -->
 {% extends "base.html" %}
 
 {% block title %}Worker Dashboard{% endblock %}
@@ -930,10 +713,10 @@ WORKER_DASHBOARD_TEMPLATE = '''
     }
 </script>
 {% endblock %}
-'''
 
-# Manager Dashboard template
-MANAGER_DASHBOARD_TEMPLATE = '''
+<!-- ============================ -->
+<!-- FILE: Manager_dashboard.html -->
+<!-- ============================ -->
 {% extends "base.html" %}
 
 {% block title %}Manager Dashboard{% endblock %}
@@ -1110,7 +893,7 @@ MANAGER_DASHBOARD_TEMPLATE = '''
                         <div class="d-flex justify-content-between align-items-start">
                             <div>
                                 <h6 class="alert-heading">
-                                    <i class="fas fa-exclamation-circle"></i> {{ alert.worker_name }}
+                                    <i class="fas fa-exclamation-circle"></i> {{ alert.worker.name }}
                                 </h6>
                                 <p class="mb-1">{{ alert.message }}</p>
                                 <small class="text-muted">
@@ -1343,7 +1126,7 @@ MANAGER_DASHBOARD_TEMPLATE = '''
     }
     
     function viewAllReports() {
-        window.location.href = '/reports';
+        window.location.href = '/manager/reports';
     }
     
     // Auto-refresh dashboard every 30 seconds
@@ -1356,10 +1139,10 @@ MANAGER_DASHBOARD_TEMPLATE = '''
     }, 30000);
 </script>
 {% endblock %}
-'''
 
-# Reports template
-REPORTS_TEMPLATE = '''
+<!-- ============================ -->
+<!-- FILE: Reports.html -->
+<!-- ============================ -->
 {% extends "base.html" %}
 
 {% block title %}Reports & Analytics{% endblock %}
@@ -2255,11 +2038,11 @@ REPORTS_TEMPLATE = '''
         }, 3000);
     }
 </script>
-{% endblock %}
-'''
+{% endblock %}ll
 
-# Alerts template
-ALERTS_TEMPLATE = '''
+<!-- ============================ -->
+<!-- FILE: Alert.html -->
+<!-- ============================ -->
 {% extends "base.html" %}
 
 {% block title %}Alert Management{% endblock %}
@@ -3035,929 +2818,373 @@ ALERTS_TEMPLATE = '''
     document.head.appendChild(style);
 </script>
 {% endblock %}
-'''
 
-# ESP32 Arduino code as string
-ESP32_CODE = '''
-#include <WiFi.h>
-#include <HTTPClient.h>
-#include <ArduinoJson.h>
+<!-- ============================ -->
+<!-- FILE: style.css -->
+<!-- ============================ -->
+/* Smart Safety Helmet - Main Styles */
 
-// ========= CONFIGURATION =========
-const char* ssid = "Varun";
-const char* password = "VARUN0430";
-const char* serverUrl = "http://YOUR_SERVER_IP:5000/api/helmet/data";
-
-// Worker and Helmet IDs
-const String WORKER_ID = "WKR001";
-const String HELMET_ID = "HLM001";
-
-// -------- PINS --------
-#define GAS_PIN      34
-#define TEMP_PIN     35
-#define IR_PIN       15
-#define BUZZER_PIN   26
-#define SOS_PIN      4
-#define BATTERY_PIN  36
-
-// -------- THRESHOLDS --------
-#define GAS_THRESHOLD    2700
-#define TEMP_THRESHOLD   40.0
-#define FALL_THRESHOLD   2700
-
-// -------- VARIABLES --------
-unsigned long lastSendTime = 0;
-const unsigned long SEND_INTERVAL = 5000; // 5 seconds
-
-bool buzzerState = false;
-unsigned long buzzerStartTime = 0;
-const unsigned long BUZZER_DURATION = 3000; // 3 seconds
-
-// -------- ACCELEROMETER --------
-int lastX = 0, lastY = 0, lastZ = 0;
-int xVal, yVal, zVal;
-
-// ================= SETUP =================
-void setup() {
-  Serial.begin(115200);
-  
-  // Initialize pins
-  pinMode(IR_PIN, INPUT);
-  pinMode(BUZZER_PIN, OUTPUT);
-  pinMode(SOS_PIN, INPUT_PULLUP);
-  
-  digitalWrite(BUZZER_PIN, LOW);
-  
-  Serial.println("Smart Safety Helmet - ESP32");
-  
-  // Connect to WiFi
-  connectToWiFi();
-  
-  // Initial sensor readings
-  readAccelerometer();
-  lastX = xVal;
-  lastY = yVal;
-  lastZ = zVal;
+/* Base styles */
+:root {
+    --primary: #2c3e50;
+    --secondary: #3498db;
+    --danger: #e74c3c;
+    --warning: #f39c12;
+    --success: #2ecc71;
+    --info: #17a2b8;
+    --light: #ecf0f1;
+    --dark: #34495e;
 }
 
-void connectToWiFi() {
-  Serial.print("Connecting to WiFi");
-  WiFi.begin(ssid, password);
-  
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-    delay(500);
-    Serial.print(".");
-    attempts++;
-  }
-  
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nWiFi Connected!");
-    Serial.print("IP Address: ");
-    Serial.println(WiFi.localIP());
-  } else {
-    Serial.println("\nFailed to connect to WiFi");
-  }
+body {
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    min-height: 100vh;
 }
 
-// ================= SENSOR FUNCTIONS =================
-float readTemperature() {
-  int rawTemp = analogRead(TEMP_PIN);
-  float voltage = rawTemp * (3.3 / 4095.0);
-  float temperature = (voltage - 0.5) * 100.0;
-  return temperature;
+/* Login page */
+.login-container {
+    background: rgba(255, 255, 255, 0.95);
+    border-radius: 20px;
+    padding: 40px;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
 }
 
-int readGas() {
-  return analogRead(GAS_PIN);
+.login-header {
+    text-align: center;
+    margin-bottom: 40px;
 }
 
-void readAccelerometer() {
-  xVal = analogRead(32);
-  yVal = analogRead(33);
-  zVal = analogRead(25);
+.login-header i {
+    font-size: 4em;
+    color: var(--primary);
+    margin-bottom: 20px;
 }
 
-bool detectFall() {
-  readAccelerometer();
-  
-  // Calculate change in acceleration
-  int deltaX = abs(xVal - lastX);
-  int deltaY = abs(yVal - lastY);
-  int deltaZ = abs(zVal - lastZ);
-  
-  // Update last values
-  lastX = xVal;
-  lastY = yVal;
-  lastZ = zVal;
-  
-  // Detect sudden change (fall)
-  if (deltaX > FALL_THRESHOLD || deltaY > FALL_THRESHOLD || deltaZ > FALL_THRESHOLD) {
-    return true;
-  }
-  
-  return false;
+/* Cards */
+.card {
+    border: none;
+    border-radius: 15px;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.08);
+    transition: all 0.3s ease;
+    margin-bottom: 20px;
 }
 
-bool isHelmetWorn() {
-  return digitalRead(IR_PIN) == LOW;
+.card:hover {
+    transform: translateY(-5px);
+    box-shadow: 0 15px 40px rgba(0, 0, 0, 0.12);
 }
 
-float readBattery() {
-  int raw = analogRead(BATTERY_PIN);
-  float voltage = raw * (3.3 / 4095.0);
-  return voltage * 2.0; // Voltage divider
+.card-header {
+    border-radius: 15px 15px 0 0 !important;
+    font-weight: 600;
+    border: none;
 }
 
-bool isSOSPressed() {
-  return digitalRead(SOS_PIN) == LOW;
+/* Risk indicators */
+.risk-indicator {
+    padding: 8px 20px;
+    border-radius: 20px;
+    font-weight: bold;
+    font-size: 0.9em;
+    display: inline-block;
 }
 
-// ================= BUZZER CONTROL =================
-void controlBuzzer(bool state) {
-  if (state && !buzzerState) {
-    buzzerState = true;
-    buzzerStartTime = millis();
-    digitalWrite(BUZZER_PIN, HIGH);
-  } else if (!state && buzzerState) {
-    buzzerState = false;
-    digitalWrite(BUZZER_PIN, LOW);
-  }
-  
-  // Auto-off after duration
-  if (buzzerState && (millis() - buzzerStartTime > BUZZER_DURATION)) {
-    controlBuzzer(false);
-  }
+.risk-safe {
+    background: linear-gradient(135deg, #2ecc71 0%, #27ae60 100%);
+    color: white;
 }
 
-// ================= SEND DATA TO SERVER =================
-void sendSensorData() {
-  if (WiFi.status() != WL_CONNECTED) {
-    connectToWiFi();
-    return;
-  }
-  
-  // Read sensors
-  float temperature = readTemperature();
-  int gas = readGas();
-  bool helmetWorn = isHelmetWorn();
-  bool fall = detectFall();
-  bool sos = isSOSPressed();
-  float battery = readBattery();
-  
-  // Create JSON payload
-  DynamicJsonDocument doc(512);
-  doc["worker_id"] = WORKER_ID;
-  doc["helmet_id"] = HELMET_ID;
-  doc["helmet_worn"] = helmetWorn;
-  doc["gas"] = gas;
-  doc["temperature"] = temperature;
-  doc["fall"] = fall || sos; // Treat SOS as fall emergency
-  doc["battery"] = battery;
-  doc["timestamp"] = millis();
-  
-  String payload;
-  serializeJson(doc, payload);
-  
-  Serial.println("Sending data: " + payload);
-  
-  // Send HTTP POST
-  HTTPClient http;
-  http.begin(serverUrl);
-  http.addHeader("Content-Type", "application/json");
-  
-  int httpCode = http.POST(payload);
-  
-  if (httpCode > 0) {
-    String response = http.getString();
-    Serial.println("Response: " + response);
-    
-    // Parse response for buzzer control
-    DynamicJsonDocument respDoc(256);
-    DeserializationError error = deserializeJson(respDoc, response);
-    
-    if (!error) {
-      String buzzerCmd = respDoc["buzzer"];
-      if (buzzerCmd == "ON") {
-        controlBuzzer(true);
-      } else {
-        controlBuzzer(false);
-      }
-      
-      // Print risk info
-      Serial.print("Risk Score: ");
-      Serial.println(respDoc["risk_score"].as<int>());
-      Serial.print("Risk Level: ");
-      Serial.println(respDoc["risk_level"].as<String>());
+.risk-warning {
+    background: linear-gradient(135deg, #f39c12 0%, #d35400 100%);
+    color: white;
+}
+
+.risk-danger {
+    background: linear-gradient(135deg, #e74c3c 0%, #c0392b 100%);
+    color: white;
+    animation: pulse 2s infinite;
+}
+
+@keyframes pulse {
+    0% { box-shadow: 0 0 0 0 rgba(231, 76, 60, 0.7); }
+    70% { box-shadow: 0 0 0 10px rgba(231, 76, 60, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(231, 76, 60, 0); }
+}
+
+/* Status badges */
+.status-badge {
+    padding: 5px 15px;
+    border-radius: 20px;
+    font-weight: 600;
+    font-size: 0.8em;
+}
+
+.status-active {
+    background: var(--success);
+    color: white;
+}
+
+.status-inactive {
+    background: #95a5a6;
+    color: white;
+}
+
+.status-alert {
+    background: var(--danger);
+    color: white;
+    animation: blink 1s infinite;
+}
+
+@keyframes blink {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+}
+
+/* Progress bars */
+.progress {
+    height: 25px;
+    border-radius: 12px;
+    overflow: hidden;
+}
+
+.progress-bar {
+    border-radius: 12px;
+    font-weight: 600;
+    line-height: 25px;
+}
+
+/* Tables */
+.table {
+    --bs-table-bg: transparent;
+}
+
+.table th {
+    font-weight: 600;
+    color: var(--primary);
+    border-bottom-width: 2px;
+}
+
+.table-hover tbody tr:hover {
+    background-color: rgba(52, 152, 219, 0.1);
+}
+
+/* Buttons */
+.btn {
+    border-radius: 8px;
+    font-weight: 600;
+    padding: 10px 20px;
+    transition: all 0.3s ease;
+}
+
+.btn-primary {
+    background: linear-gradient(135deg, #3498db 0%, #2980b9 100%);
+    border: none;
+}
+
+.btn-danger {
+    background: linear-gradient(135deg, #e74c3c 0%, #c0392b 100%);
+    border: none;
+}
+
+.btn-warning {
+    background: linear-gradient(135deg, #f39c12 0%, #d35400 100%);
+    border: none;
+    color: white;
+}
+
+.btn-success {
+    background: linear-gradient(135deg, #2ecc71 0%, #27ae60 100%);
+    border: none;
+}
+
+.btn:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 5px 15px rgba(0, 0, 0, 0.2);
+}
+
+/* Real-time indicator */
+.real-time-indicator {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    display: inline-block;
+    margin-right: 5px;
+    animation: blink 1.5s infinite;
+}
+
+.real-time-online {
+    background: var(--success);
+}
+
+.real-time-offline {
+    background: #95a5a6;
+}
+
+/* Sensor values */
+.sensor-value {
+    font-size: 2.5em;
+    font-weight: 700;
+    margin: 10px 0;
+}
+
+.sensor-label {
+    color: #7f8c8d;
+    font-size: 0.9em;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+}
+
+/* Alerts */
+.alert-card {
+    border-left: 5px solid var(--danger);
+    animation: slideIn 0.5s ease;
+}
+
+@keyframes slideIn {
+    from {
+        opacity: 0;
+        transform: translateX(-20px);
     }
-  } else {
-    Serial.println("HTTP Error: " + String(httpCode));
-  }
-  
-  http.end();
+    to {
+        opacity: 1;
+        transform: translateX(0);
+    }
 }
 
-// ================= LOOP =================
-void loop() {
-  // Check SOS button
-  if (isSOSPressed()) {
-    Serial.println("SOS BUTTON PRESSED!");
-    controlBuzzer(true);
-    delay(1000); // Immediate response
-  }
-  
-  // Send data at regular intervals
-  if (millis() - lastSendTime > SEND_INTERVAL) {
-    sendSensorData();
-    lastSendTime = millis();
-  }
-  
-  // Check local thresholds for immediate response
-  float temp = readTemperature();
-  int gasVal = readGas();
-  
-  if (temp > TEMP_THRESHOLD || gasVal > GAS_THRESHOLD) {
-    controlBuzzer(true);
-  }
-  
-  delay(100);
+/* Charts container */
+.chart-container {
+    position: relative;
+    height: 300px;
+    width: 100%;
 }
-'''
 
-# Requirements.txt as string
-REQUIREMENTS_TXT = '''Flask==2.3.3
-Flask-SQLAlchemy==3.0.5
-Flask-JWT-Extended==4.5.2
-Flask-CORS==4.0.0
-Werkzeug==2.3.7
-requests==2.31.0
-python-dotenv==1.0.0
-'''
+/* Sidebar */
+.sidebar {
+    background: linear-gradient(180deg, var(--primary) 0%, #1a252f 100%);
+    min-height: 100vh;
+    color: white;
+    padding: 0;
+}
 
-# ============================ HELPER CLASSES ============================
-class RiskEngine:
-    @staticmethod
-    def calculate_risk(data):
-        risk_score = 0
-        alerts = []
-        
-        # Gas risk
-        if data['gas'] > Config.GAS_THRESHOLD:
-            risk_score += 30
-            alerts.append('High gas concentration detected')
-        
-        # Temperature risk
-        if data['temperature'] > Config.TEMP_THRESHOLD:
-            risk_score += 25
-            alerts.append(f'High temperature: {data["temperature"]}°C')
-        
-        # Helmet not worn
-        if not data['helmet_worn']:
-            risk_score += 20
-            alerts.append('Helmet not worn')
-        
-        # Fall detected
-        if data['fall']:
-            risk_score += 25
-            alerts.append('Fall detected')
-        
-        return min(risk_score, 100), alerts
-    
-    @staticmethod
-    def get_risk_level(score):
-        if score <= Config.RISK_SAFE:
-            return 'safe', 'green'
-        elif score <= Config.RISK_WARNING:
-            return 'warning', 'orange'
-        else:
-            return 'danger', 'red'
+.sidebar-brand {
+    padding: 20px;
+    text-align: center;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
 
-class WorkSessionTracker:
-    @staticmethod
-    def handle_helmet_status(worker_id, helmet_worn):
-        conn = sqlite3.connect('safety_helmet.db')
-        c = conn.cursor()
-        now = datetime.now()
-        
-        c.execute("SELECT id, start_time FROM work_sessions WHERE worker_id = ? AND is_completed = 0 ORDER BY id DESC LIMIT 1", (worker_id,))
-        session = c.fetchone()
-        
-        if helmet_worn:
-            if not session:
-                # Start new session
-                c.execute("INSERT INTO work_sessions (worker_id, start_time, is_completed) VALUES (?, ?, ?)",
-                         (worker_id, now, 0))
-        else:
-            if session:
-                # End existing session
-                session_id, start_time = session
-                if isinstance(start_time, str):
-                    start_time = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
-                duration = int((now - start_time).total_seconds())
-                c.execute("UPDATE work_sessions SET end_time = ?, duration = ?, is_completed = 1 WHERE id = ?",
-                         (now, duration, session_id))
-        
-        conn.commit()
-        conn.close()
-    
-    @staticmethod
-    def get_worker_hours(worker_id, period='today'):
-        conn = sqlite3.connect('safety_helmet.db')
-        c = conn.cursor()
-        now = datetime.now()
-        
-        if period == 'today':
-            start_date = now.replace(hour=0, minute=0, second=0, microsecond=0)
-            c.execute("SELECT SUM(duration) FROM work_sessions WHERE worker_id = ? AND start_time >= ? AND is_completed = 1", 
-                     (worker_id, start_date))
-        elif period == 'week':
-            start_date = now - timedelta(days=7)
-            c.execute("SELECT SUM(duration) FROM work_sessions WHERE worker_id = ? AND start_time >= ? AND is_completed = 1", 
-                     (worker_id, start_date))
-        else:  # month
-            start_date = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-            c.execute("SELECT SUM(duration) FROM work_sessions WHERE worker_id = ? AND start_time >= ? AND is_completed = 1", 
-                     (worker_id, start_date))
-        
-        result = c.fetchone()
-        total_seconds = result[0] or 0
-        
-        # Check for active session
-        c.execute("SELECT start_time FROM work_sessions WHERE worker_id = ? AND is_completed = 0 ORDER BY id DESC LIMIT 1", (worker_id,))
-        active_session = c.fetchone()
-        
-        if active_session:
-            start_time = active_session[0]
-            if isinstance(start_time, str):
-                start_time = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
-            current_duration = (now - start_time).total_seconds()
-            total_seconds += current_duration
-        
-        conn.close()
-        hours = total_seconds / 3600
-        return round(hours, 2)
+.sidebar-nav {
+    padding: 20px 0;
+}
 
-class AlertSystem:
-    @staticmethod
-    def send_telegram_alert(chat_id, message):
-        # Placeholder for Telegram integration
-        print(f"Telegram Alert to {chat_id}: {message}")
-        return True
-    
-    @staticmethod
-    def create_alert(worker_id, helmet_id, risk_score, alerts_list):
-        conn = sqlite3.connect('safety_helmet.db')
-        c = conn.cursor()
-        
-        # Get worker info
-        c.execute("SELECT name FROM workers WHERE worker_id = ?", (worker_id,))
-        worker = c.fetchone()
-        worker_name = worker[0] if worker else "Unknown"
-        
-        # Create alert record
-        alert_type = ','.join([a.split(':')[0] for a in alerts_list]) if alerts_list else 'general'
-        message = '; '.join(alerts_list) if alerts_list else 'Risk alert triggered'
-        
-        c.execute("""INSERT INTO alerts (worker_id, helmet_id, alert_type, risk_score, message, timestamp, acknowledged) 
-                     VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                 (worker_id, helmet_id, alert_type, risk_score, message, datetime.now(), 0))
-        
-        conn.commit()
-        
-        # Send Telegram alerts
-        alert_message = f"🚨 SAFETY ALERT 🚨\nWorker: {worker_name}\nID: {worker_id}\nRisk Score: {risk_score}\nAlerts: {message}"
-        
-        # Send to manager
-        c.execute("SELECT telegram_id FROM users WHERE role = 'manager' LIMIT 1")
-        manager = c.fetchone()
-        if manager and manager[0]:
-            AlertSystem.send_telegram_alert(manager[0], alert_message)
-        
-        # Send to worker
-        c.execute("SELECT telegram_id FROM users WHERE worker_id = ?", (worker_id,))
-        worker_user = c.fetchone()
-        if worker_user and worker_user[0]:
-            AlertSystem.send_telegram_alert(worker_user[0], alert_message)
-        
-        conn.close()
+.sidebar-nav a {
+    display: block;
+    padding: 12px 25px;
+    color: rgba(255, 255, 255, 0.8);
+    text-decoration: none;
+    transition: all 0.3s ease;
+    border-left: 3px solid transparent;
+}
 
-# ============================ FLASK APPLICATION ============================
-app = Flask(__name__)
-app.config.from_object(Config)
-app.secret_key = Config.SECRET_KEY
-CORS(app)
-jwt = JWTManager(app)
+.sidebar-nav a:hover {
+    background: rgba(255, 255, 255, 0.1);
+    color: white;
+    border-left-color: var(--secondary);
+}
 
-# Initialize database
-init_db()
+.sidebar-nav a.active {
+    background: rgba(52, 152, 219, 0.2);
+    color: white;
+    border-left-color: var(--secondary);
+}
 
-# ============================ UTILITY FUNCTIONS ============================
-def get_db_connection():
-    conn = sqlite3.connect('safety_helmet.db')
-    conn.row_factory = sqlite3.Row
-    return conn
+.sidebar-nav i {
+    width: 25px;
+    margin-right: 10px;
+}
 
-def role_required(role):
-    def decorator(f):
-        @wraps(f)
-        def decorated_function(*args, **kwargs):
-            if 'username' not in session:
-                return redirect(url_for('login'))
-            
-            if session.get('role') != role:
-                flash('Unauthorized access', 'error')
-                return redirect(url_for('dashboard'))
-            
-            return f(*args, **kwargs)
-        return decorated_function
-    return decorator
-
-def get_time_ago(timestamp):
-    if isinstance(timestamp, str):
-        timestamp = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-    
-    now = datetime.now()
-    diff = now - timestamp
-    
-    if diff.days > 0:
-        return f"{diff.days} days ago"
-    elif diff.seconds > 3600:
-        hours = diff.seconds // 3600
-        return f"{hours} hours ago"
-    elif diff.seconds > 60:
-        minutes = diff.seconds // 60
-        return f"{minutes} minutes ago"
-    else:
-        return "Just now"
-
-# ============================ ROUTES ============================
-@app.route('/')
-def index():
-    return redirect(url_for('login'))
-
-@app.route('/login', methods=['GET', 'POST'])
-def login():
-    if request.method == 'POST':
-        username = request.form.get('username')
-        password = request.form.get('password')
-        
-        conn = get_db_connection()
-        user = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
-        conn.close()
-        
-        if user and check_password_hash(user['password_hash'], password):
-            session['user_id'] = user['id']
-            session['username'] = user['username']
-            session['role'] = user['role']
-            session['worker_id'] = user['worker_id']
-            
-            # Create access token
-            access_token = create_access_token(identity=username)
-            response = redirect(url_for('dashboard'))
-            response.set_cookie('access_token', access_token)
-            
-            return response
-        else:
-            flash('Invalid credentials', 'error')
-    
-    return render_template('login.html')
-
-@app.route('/dashboard')
-def dashboard():
-    if 'username' not in session:
-        return redirect(url_for('login'))
-    
-    if session['role'] == 'worker':
-        return redirect(url_for('worker_dashboard'))
-    else:
-        return redirect(url_for('manager_dashboard'))
-
-@app.route('/worker/dashboard')
-@role_required('worker')
-def worker_dashboard():
-    conn = get_db_connection()
-    
-    # Get worker info
-    worker = conn.execute("SELECT * FROM workers WHERE worker_id = ?", (session['worker_id'],)).fetchone()
-    
-    # Get latest log
-    latest_log = conn.execute("SELECT * FROM helmet_logs WHERE worker_id = ? ORDER BY timestamp DESC LIMIT 1", 
-                             (session['worker_id'],)).fetchone()
-    
-    # Get today's hours
-    today_hours = WorkSessionTracker.get_worker_hours(session['worker_id'], 'today')
-    
-    # Get recent alerts
-    recent_alerts = conn.execute("SELECT * FROM alerts WHERE worker_id = ? ORDER BY timestamp DESC LIMIT 5", 
-                                (session['worker_id'],)).fetchall()
-    
-    conn.close()
-    
-    return render_template('worker_dashboard.html',
-                         worker=worker,
-                         latest_log=latest_log,
-                         today_hours=today_hours,
-                         recent_alerts=recent_alerts)
-
-@app.route('/manager/dashboard')
-@role_required('manager')
-def manager_dashboard():
-    conn = get_db_connection()
-    
-    # Get all workers
-    workers_data = []
-    workers = conn.execute("SELECT * FROM workers").fetchall()
-    
-    for worker in workers:
-        # Get latest log for each worker
-        latest_log = conn.execute("SELECT * FROM helmet_logs WHERE worker_id = ? ORDER BY timestamp DESC LIMIT 1", 
-                                 (worker['worker_id'],)).fetchone()
-        
-        if latest_log and latest_log['helmet_worn']:
-            risk_level = RiskEngine.get_risk_level(latest_log['risk_score'])[0]
-            is_active = True
-            last_update = latest_log['timestamp']
-            risk_score = latest_log['risk_score']
-        else:
-            risk_level = 'inactive'
-            is_active = False
-            last_update = None
-            risk_score = 0
-        
-        # Get today's hours
-        today_hours = WorkSessionTracker.get_worker_hours(worker['worker_id'], 'today')
-        
-        workers_data.append({
-            'worker_id': worker['worker_id'],
-            'name': worker['name'],
-            'department': worker['department'],
-            'helmet_id': worker['helmet_id'],
-            'risk_score': risk_score,
-            'risk_level': risk_level,
-            'last_update': last_update,
-            'is_active': is_active,
-            'today_hours': today_hours
-        })
-    
-    # Get unacknowledged alerts
-    alerts = conn.execute("""
-        SELECT a.*, w.name as worker_name 
-        FROM alerts a 
-        LEFT JOIN workers w ON a.worker_id = w.worker_id 
-        WHERE a.acknowledged = 0 
-        ORDER BY a.timestamp DESC 
-        LIMIT 10
-    """).fetchall()
-    
-    conn.close()
-    
-    return render_template('manager_dashboard.html',
-                         workers=workers_data,
-                         alerts=alerts)
-
-@app.route('/reports')
-@role_required('manager')
-def reports_page():
-    return render_template('reports.html', today=datetime.now().strftime('%Y-%m-%d'))
-
-@app.route('/alerts')
-@role_required('manager')
-def alerts_page():
-    return render_template('alerts.html')
-
-@app.route('/api/helmet/data', methods=['POST'])
-def receive_helmet_data():
-    try:
-        data = request.get_json()
-        
-        # Validate required fields
-        required_fields = ['worker_id', 'helmet_id', 'helmet_worn', 'gas', 'temperature', 'fall']
-        for field in required_fields:
-            if field not in data:
-                return jsonify({'error': f'Missing field: {field}'}), 400
-        
-        # Convert types
-        worker_id = str(data['worker_id'])
-        helmet_id = str(data['helmet_id'])
-        helmet_worn = bool(data['helmet_worn'])
-        gas = int(data['gas'])
-        temperature = float(data['temperature'])
-        fall = bool(data['fall'])
-        battery = float(data.get('battery', 0.0))
-        
-        # Calculate risk score
-        risk_score, alerts = RiskEngine.calculate_risk({
-            'gas': gas,
-            'temperature': temperature,
-            'helmet_worn': helmet_worn,
-            'fall': fall
-        })
-        
-        # Create helmet log
-        conn = get_db_connection()
-        conn.execute("""
-            INSERT INTO helmet_logs (worker_id, helmet_id, gas, temperature, helmet_worn, fall, risk_score, battery, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (worker_id, helmet_id, gas, temperature, helmet_worn, fall, risk_score, battery, datetime.now()))
-        
-        # Update worker active status
-        conn.execute("UPDATE workers SET is_active = ? WHERE worker_id = ?", (1 if helmet_worn else 0, worker_id))
-        
-        conn.commit()
-        conn.close()
-        
-        # Handle work session tracking
-        WorkSessionTracker.handle_helmet_status(worker_id, helmet_worn)
-        
-        # Check for alerts
-        if risk_score >= Config.RISK_WARNING and alerts:
-            AlertSystem.create_alert(worker_id, helmet_id, risk_score, alerts)
-        
-        # Determine buzzer status
-        buzzer_status = "ON" if risk_score >= Config.RISK_WARNING else "OFF"
-        
-        return jsonify({
-            'status': 'success',
-            'risk_score': risk_score,
-            'risk_level': RiskEngine.get_risk_level(risk_score)[0],
-            'buzzer': buzzer_status
-        }), 200
-        
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/worker/status')
-@role_required('worker')
-def get_worker_status():
-    conn = get_db_connection()
-    
-    # Get latest log
-    latest_log = conn.execute("SELECT * FROM helmet_logs WHERE worker_id = ? ORDER BY timestamp DESC LIMIT 1", 
-                             (session['worker_id'],)).fetchone()
-    
-    conn.close()
-    
-    if not latest_log:
-        return jsonify({
-            'status': 'offline',
-            'message': 'No helmet data available'
-        }), 200
-    
-    risk_level, color = RiskEngine.get_risk_level(latest_log['risk_score'])
-    
-    return jsonify({
-        'worker_id': session['worker_id'],
-        'helmet_worn': bool(latest_log['helmet_worn']),
-        'gas': latest_log['gas'],
-        'temperature': latest_log['temperature'],
-        'fall': bool(latest_log['fall']),
-        'risk_score': latest_log['risk_score'],
-        'risk_level': risk_level,
-        'battery': latest_log['battery'],
-        'last_update': latest_log['timestamp'],
-        'today_hours': WorkSessionTracker.get_worker_hours(session['worker_id'], 'today')
-    })
-
-@app.route('/api/manager/workers')
-@role_required('manager')
-def get_all_workers():
-    conn = get_db_connection()
-    
-    workers = conn.execute("SELECT * FROM workers").fetchall()
-    result = []
-    
-    for worker in workers:
-        latest_log = conn.execute("SELECT * FROM helmet_logs WHERE worker_id = ? ORDER BY timestamp DESC LIMIT 1", 
-                                 (worker['worker_id'],)).fetchone()
-        
-        worker_data = {
-            'worker_id': worker['worker_id'],
-            'name': worker['name'],
-            'department': worker['department'],
-            'helmet_id': worker['helmet_id'],
-            'is_active': bool(worker['is_active'])
-        }
-        
-        if latest_log:
-            risk_level, color = RiskEngine.get_risk_level(latest_log['risk_score'])
-            worker_data.update({
-                'gas': latest_log['gas'],
-                'temperature': latest_log['temperature'],
-                'helmet_worn': bool(latest_log['helmet_worn']),
-                'risk_score': latest_log['risk_score'],
-                'risk_level': risk_level,
-                'last_update': latest_log['timestamp'],
-                'today_hours': WorkSessionTracker.get_worker_hours(worker['worker_id'], 'today'),
-                'week_hours': WorkSessionTracker.get_worker_hours(worker['worker_id'], 'week'),
-                'month_hours': WorkSessionTracker.get_worker_hours(worker['worker_id'], 'month')
-            })
-        
-        result.append(worker_data)
-    
-    conn.close()
-    return jsonify(result)
-
-@app.route('/api/alerts')
-def get_alerts():
-    conn = get_db_connection()
-    
-    if session.get('role') == 'worker':
-        alerts = conn.execute("""
-            SELECT a.*, w.name as worker_name 
-            FROM alerts a 
-            LEFT JOIN workers w ON a.worker_id = w.worker_id 
-            WHERE a.worker_id = ? 
-            ORDER BY a.timestamp DESC 
-            LIMIT 50
-        """, (session.get('worker_id'),)).fetchall()
-    else:
-        alerts = conn.execute("""
-            SELECT a.*, w.name as worker_name 
-            FROM alerts a 
-            LEFT JOIN workers w ON a.worker_id = w.worker_id 
-            ORDER BY a.timestamp DESC 
-            LIMIT 100
-        """).fetchall()
-    
-    result = []
-    for alert in alerts:
-        result.append({
-            'id': alert['id'],
-            'worker_name': alert['worker_name'],
-            'worker_id': alert['worker_id'],
-            'alert_type': alert['alert_type'],
-            'risk_score': alert['risk_score'],
-            'message': alert['message'],
-            'timestamp': alert['timestamp'],
-            'acknowledged': bool(alert['acknowledged']),
-            'acknowledged_by': alert['acknowledged_by'],
-            'time_ago': get_time_ago(alert['timestamp'])
-        })
-    
-    conn.close()
-    return jsonify(result)
-
-@app.route('/api/alerts/<int:alert_id>/acknowledge', methods=['POST'])
-@role_required('manager')
-def acknowledge_alert(alert_id):
-    conn = get_db_connection()
-    
-    conn.execute("""
-        UPDATE alerts 
-        SET acknowledged = 1, acknowledged_by = ?, acknowledged_at = ? 
-        WHERE id = ?
-    """, (session['username'], datetime.now(), alert_id))
-    
-    conn.commit()
-    conn.close()
-    
-    return jsonify({'status': 'success'})
-
-@app.route('/api/reports/daily')
-@role_required('manager')
-def get_daily_report():
-    today = datetime.now().date()
-    start_date = datetime.combine(today, datetime.min.time())
-    end_date = datetime.combine(today, datetime.max.time())
-    
-    conn = get_db_connection()
-    
-    # Get all logs for today
-    logs = conn.execute("SELECT * FROM helmet_logs WHERE timestamp BETWEEN ? AND ?", 
-                       (start_date, end_date)).fetchall()
-    
-    # Get all sessions for today
-    sessions = conn.execute("SELECT * FROM work_sessions WHERE start_time BETWEEN ? AND ? AND is_completed = 1", 
-                           (start_date, end_date)).fetchall()
-    
-    # Get all alerts for today
-    alerts = conn.execute("SELECT * FROM alerts WHERE timestamp BETWEEN ? AND ?", 
-                         (start_date, end_date)).fetchall()
-    
-    conn.close()
-    
-    report = {
-        'date': today.isoformat(),
-        'total_workers': len([w for w in logs]),
-        'active_workers': len([l for l in logs if l['helmet_worn']]),
-        'high_risk_incidents': len([l for l in logs if l['risk_score'] >= Config.RISK_WARNING]),
-        'total_alerts': len(alerts),
-        'total_work_hours': sum(s['duration'] for s in sessions if s['duration']) / 3600 if sessions else 0,
-        'average_risk_score': sum(l['risk_score'] for l in logs) / len(logs) if logs else 0
+/* Mobile responsive */
+@media (max-width: 768px) {
+    .login-container {
+        margin: 20px;
+        padding: 30px;
     }
     
-    return jsonify(report)
-
-@app.route('/api/worker/sos', methods=['POST'])
-@role_required('worker')
-def send_sos():
-    try:
-        conn = get_db_connection()
-        
-        # Get worker info
-        worker = conn.execute("SELECT * FROM workers WHERE worker_id = ?", (session['worker_id'],)).fetchone()
-        
-        # Create SOS alert
-        conn.execute("""
-            INSERT INTO alerts (worker_id, helmet_id, alert_type, risk_score, message, timestamp, acknowledged)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (session['worker_id'], worker['helmet_id'], 'sos', 100, 'EMERGENCY SOS ALERT - Worker needs immediate assistance!', datetime.now(), 0))
-        
-        conn.commit()
-        conn.close()
-        
-        # Send Telegram alert
-        alert_message = f"🚨 EMERGENCY SOS ALERT 🚨\nWorker: {worker['name']}\nID: {session['worker_id']}\nLocation: Unknown\nTime: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        
-        # Send to manager
-        conn = get_db_connection()
-        manager = conn.execute("SELECT telegram_id FROM users WHERE role = 'manager' LIMIT 1").fetchone()
-        if manager and manager['telegram_id']:
-            AlertSystem.send_telegram_alert(manager['telegram_id'], alert_message)
-        conn.close()
-        
-        return jsonify({'status': 'success', 'message': 'SOS alert sent successfully!'})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/logout')
-def logout():
-    session.clear()
-    response = redirect(url_for('login'))
-    response.delete_cookie('access_token')
-    return response
-
-# ============================ RENDER TEMPLATE HELPERS ============================
-@app.context_processor
-def utility_processor():
-    def datetime_format(value, format='%H:%M:%S'):
-        if isinstance(value, str):
-            value = datetime.fromisoformat(value.replace('Z', '+00:00'))
-        return value.strftime(format)
-    
-    def date_format(value, format='%Y-%m-%d'):
-        if isinstance(value, str):
-            value = datetime.fromisoformat(value.replace('Z', '+00:00'))
-        return value.strftime(format)
-    
-    return dict(datetime_format=datetime_format, date_format=date_format)
-
-# Custom template rendering
-def render_template(template_name, **context):
-    templates = {
-        'base.html': BASE_TEMPLATE,
-        'login.html': LOGIN_TEMPLATE,
-        'worker_dashboard.html': WORKER_DASHBOARD_TEMPLATE,
-        'manager_dashboard.html': MANAGER_DASHBOARD_TEMPLATE,
-        'reports.html': REPORTS_TEMPLATE,
-        'alerts.html': ALERTS_TEMPLATE
+    .card {
+        margin-bottom: 15px;
     }
     
-    if template_name not in templates:
-        return "Template not found", 404
+    .sensor-value {
+        font-size: 2em;
+    }
     
-    # Render the template using Jinja2
-    from jinja2 import Environment, BaseLoader, TemplateNotFound
-    
-    env = Environment(loader=BaseLoader())
-    
-    # Register custom filters
-    env.filters['datetime_format'] = utility_processor()['datetime_format']
-    env.filters['date_format'] = utility_processor()['date_format']
-    
-    # Create a template that extends base.html
-    template_content = templates[template_name]
-    
-    # For child templates, we need to handle the extends directive
-    if '{% extends' in template_content:
-        # Get the base template name from the extends directive
-        import re
-        match = re.search(r'{% extends "([^"]+)" %}', template_content)
-        if match:
-            base_template_name = match.group(1)
-            if base_template_name in templates:
-                # Replace the extends with the actual base template content
-                base_content = templates[base_template_name]
-                # Remove the extends directive and render blocks
-                template_content = template_content.replace(match.group(0), '')
-                # For simplicity, we'll just render the child template directly
-                # In a real implementation, you'd need a proper template inheritance system
-    
-    template = env.from_string(template_content)
-    return template.render(**context, session=session, request=request)
+    .sidebar {
+        min-height: auto;
+        margin-bottom: 20px;
+    }
+}
 
-# ============================ MAIN EXECUTION ============================
-if __name__ == '__main__':
-    print("Initializing Smart Safety Helmet System...")
-    print("Database initialized with sample data")
-    print("Starting Flask server on http://0.0.0.0:5000")
-    print("Wifi Credentials: SSID='Varun', Password='VARUN0430'")
-    print("\nAccess the system at:")
-    print("  - Login: http://localhost:5000/login")
-    print("  - Manager Dashboard: http://localhost:5000/manager/dashboard")
-    print("  - Worker Dashboard: http://localhost:5000/worker/dashboard")
-    print("\nDefault credentials:")
-    print("  - Manager: manager / manager123")
-    print("  - Worker: worker001 / worker123")
-    
-    app.run(host='0.0.0.0', port=5000, debug=True)
+/* Animations */
+.fade-in {
+    animation: fadeIn 0.5s ease;
+}
+
+@keyframes fadeIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
+}
+
+/* Utility classes */
+.text-gradient {
+    background: linear-gradient(135deg, #3498db 0%, #9b59b6 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+}
+
+.glow {
+    box-shadow: 0 0 20px rgba(52, 152, 219, 0.5);
+}
+
+/* Dashboard grid */
+.dashboard-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    gap: 20px;
+    margin-bottom: 30px;
+}
+
+/* Loading spinner */
+.loading-spinner {
+    border: 3px solid #f3f3f3;
+    border-top: 3px solid var(--secondary);
+    border-radius: 50%;
+    width: 40px;
+    height: 40px;
+    animation: spin 1s linear infinite;
+    margin: 20px auto;
+}
+
+@keyframes spin {
+    0% { transform: rotate(0deg); }
+    100% { transform: rotate(360deg); }
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+    width: 8px;
+}
+
+::-webkit-scrollbar-track {
+    background: #f1f1f1;
+    border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb {
+    background: var(--secondary);
+    border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: #2980b9;
+}
