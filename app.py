@@ -1,7 +1,944 @@
-<!-- ============================ -->
-<!-- FILE: Base.html -->
-<!-- ============================ -->
-<!DOCTYPE html>
+# app.py - Complete Flask Application with Firebase Backend
+
+import os
+from flask import Flask, render_template, jsonify, request, redirect, url_for, flash, session
+from werkzeug.security import generate_password_hash, check_password_hash
+from datetime import datetime, timedelta
+import json
+import requests
+import threading
+import time
+from functools import wraps
+
+# Firebase imports
+import firebase_admin
+from firebase_admin import credentials, firestore, auth
+
+# Initialize Firebase
+firebase_config = {
+    "apiKey": "AIzaSyAsZL4ynUt7c5oQPXMKMCUGjmHXRmNf3FA",
+    "authDomain": "smart-worker-helmet.firebaseapp.com",
+    "projectId": "smart-worker-helmet",
+    "storageBucket": "smart-worker-helmet.firebasestorage.app",
+    "messagingSenderId": "425355245105",
+    "appId": "1:425355245105:web:03145b1a5efd6924da4710",
+    "measurementId": "G-901XDPTTXS"
+}
+
+# Try to initialize Firebase with service account or use default
+try:
+    # Try to initialize with credentials if available
+    cred = credentials.Certificate("serviceAccountKey.json")
+    firebase_admin.initialize_app(cred)
+except:
+    # Use default credentials
+    firebase_admin.initialize_app()
+
+# Get Firestore database
+db = firestore.client()
+
+app = Flask(__name__)
+app.secret_key = 'smart-safety-helmet-secret-key-2024'
+
+# Configuration
+class Config:
+    # Risk thresholds
+    GAS_THRESHOLD = 2700
+    TEMP_THRESHOLD = 40
+    RISK_SAFE = 30
+    RISK_WARNING = 60
+    RISK_DANGER = 100
+    
+    # Telegram Bot Config (optional)
+    TELEGRAM_BOT_TOKEN = 'YOUR_BOT_TOKEN'
+    MANAGER_CHAT_ID = 'MANAGER_CHAT_ID'
+    
+    # WiFi credentials
+    WIFI_SSID = 'Varun'
+    WIFI_PASSWORD = 'VARUN0430'
+
+# Risk calculation engine
+class RiskEngine:
+    @staticmethod
+    def calculate_risk(data):
+        risk_score = 0
+        alerts = []
+        
+        # Gas risk
+        if data['gas'] > Config.GAS_THRESHOLD:
+            risk_score += 30
+            alerts.append('High gas concentration detected')
+        
+        # Temperature risk
+        if data['temperature'] > Config.TEMP_THRESHOLD:
+            risk_score += 25
+            alerts.append(f'High temperature: {data["temperature"]}°C')
+        
+        # Helmet not worn
+        if not data['helmet_worn']:
+            risk_score += 20
+            alerts.append('Helmet not worn')
+        
+        # Fall detected
+        if data['fall']:
+            risk_score += 25
+            alerts.append('Fall detected')
+        
+        return min(risk_score, 100), alerts
+    
+    @staticmethod
+    def get_risk_level(score):
+        if score <= Config.RISK_SAFE:
+            return 'safe', 'green'
+        elif score <= Config.RISK_WARNING:
+            return 'warning', 'orange'
+        else:
+            return 'danger', 'red'
+
+# Work session tracker
+class WorkSessionTracker:
+    @staticmethod
+    def handle_helmet_status(worker_id, helmet_worn):
+        now = datetime.now()
+        
+        # Check for existing session
+        sessions_ref = db.collection('work_sessions')
+        active_session = sessions_ref.where('worker_id', '==', worker_id)\
+                                     .where('is_completed', '==', False)\
+                                     .limit(1).get()
+        
+        if helmet_worn:
+            # Helmet is worn - start or resume session
+            if not active_session:
+                # Start new session
+                session_data = {
+                    'worker_id': worker_id,
+                    'start_time': now,
+                    'end_time': None,
+                    'duration': 0,
+                    'is_completed': False,
+                    'created_at': now
+                }
+                sessions_ref.add(session_data)
+        else:
+            # Helmet removed - end session if exists
+            for session in active_session:
+                session_ref = sessions_ref.document(session.id)
+                start_time = session.to_dict()['start_time']
+                if isinstance(start_time, str):
+                    start_time = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
+                
+                duration = (now - start_time).total_seconds()
+                session_ref.update({
+                    'end_time': now,
+                    'duration': duration,
+                    'is_completed': True
+                })
+    
+    @staticmethod
+    def get_worker_hours(worker_id, period='today'):
+        now = datetime.now()
+        
+        sessions_ref = db.collection('work_sessions')
+        query = sessions_ref.where('worker_id', '==', worker_id)\
+                           .where('is_completed', '==', True)
+        
+        if period == 'today':
+            today_start = datetime(now.year, now.month, now.day)
+            query = query.where('start_time', '>=', today_start)
+        elif period == 'week':
+            week_ago = now - timedelta(days=7)
+            query = query.where('start_time', '>=', week_ago)
+        elif period == 'month':
+            month_ago = now - timedelta(days=30)
+            query = query.where('start_time', '>=', month_ago)
+        
+        sessions = query.get()
+        
+        total_seconds = 0
+        for session in sessions:
+            session_data = session.to_dict()
+            if session_data.get('duration'):
+                total_seconds += session_data['duration']
+        
+        # Check for active session
+        active_sessions = sessions_ref.where('worker_id', '==', worker_id)\
+                                      .where('is_completed', '==', False)\
+                                      .get()
+        
+        for active in active_sessions:
+            active_data = active.to_dict()
+            start_time = active_data['start_time']
+            if isinstance(start_time, str):
+                start_time = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
+            
+            current_duration = (now - start_time).total_seconds()
+            total_seconds += current_duration
+        
+        hours = total_seconds / 3600
+        return round(hours, 2)
+
+# Alert system
+class AlertSystem:
+    @staticmethod
+    def send_telegram_alert(chat_id, message):
+        if Config.TELEGRAM_BOT_TOKEN and chat_id and Config.TELEGRAM_BOT_TOKEN != 'YOUR_BOT_TOKEN':
+            try:
+                telegram_url = f"https://api.telegram.org/bot{Config.TELEGRAM_BOT_TOKEN}/sendMessage"
+                payload = {
+                    'chat_id': chat_id,
+                    'text': message,
+                    'parse_mode': 'HTML'
+                }
+                response = requests.post(telegram_url, json=payload, timeout=5)
+                return response.status_code == 200
+            except:
+                return False
+        return False
+    
+    @staticmethod
+    def create_alert(worker_id, helmet_id, risk_score, alerts_list):
+        try:
+            # Get worker details
+            worker_ref = db.collection('workers').document(worker_id)
+            worker_doc = worker_ref.get()
+            
+            if not worker_doc.exists:
+                return
+            
+            worker_data = worker_doc.to_dict()
+            
+            # Create alert record
+            alert_data = {
+                'worker_id': worker_id,
+                'helmet_id': helmet_id,
+                'alert_type': ','.join([a.split(':')[0] for a in alerts_list]),
+                'risk_score': risk_score,
+                'message': '; '.join(alerts_list),
+                'timestamp': datetime.now(),
+                'acknowledged': False,
+                'acknowledged_by': None,
+                'acknowledged_at': None,
+                'worker_name': worker_data.get('name', 'Unknown')
+            }
+            
+            db.collection('alerts').add(alert_data)
+            
+            # Send Telegram alerts (if configured)
+            alert_message = f"🚨 <b>SAFETY ALERT</b> 🚨\n"
+            alert_message += f"Worker: {worker_data.get('name', 'Unknown')}\n"
+            alert_message += f"ID: {worker_id}\n"
+            alert_message += f"Risk Score: {risk_score}\n"
+            alert_message += f"Alerts: {', '.join(alerts_list)}\n"
+            alert_message += f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            
+            # Send to manager
+            users_ref = db.collection('users')
+            manager_query = users_ref.where('role', '==', 'manager').limit(1).get()
+            for manager in manager_query:
+                manager_data = manager.to_dict()
+                if manager_data.get('telegram_id'):
+                    AlertSystem.send_telegram_alert(manager_data['telegram_id'], alert_message)
+            
+            # Send to worker
+            worker_user_query = users_ref.where('worker_id', '==', worker_id).limit(1).get()
+            for worker_user in worker_user_query:
+                worker_user_data = worker_user.to_dict()
+                if worker_user_data.get('telegram_id'):
+                    AlertSystem.send_telegram_alert(worker_user_data['telegram_id'], alert_message)
+                    
+        except Exception as e:
+            print(f"Error creating alert: {e}")
+
+# Authentication decorators
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'user_id' not in session:
+            flash('Please login first', 'error')
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return decorated_function
+
+def role_required(role):
+    def decorator(f):
+        @wraps(f)
+        @login_required
+        def decorated_function(*args, **kwargs):
+            if session.get('role') != role:
+                flash('Unauthorized access', 'error')
+                return redirect(url_for('dashboard'))
+            return f(*args, **kwargs)
+        return decorated_function
+    return decorator
+
+# Routes
+@app.route('/')
+def index():
+    if 'user_id' in session:
+        return redirect(url_for('dashboard'))
+    return redirect(url_for('login'))
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form.get('username')
+        password = request.form.get('password')
+        
+        # Check in Firebase
+        users_ref = db.collection('users')
+        user_query = users_ref.where('username', '==', username).limit(1).get()
+        
+        if user_query:
+            user_doc = user_query[0]
+            user_data = user_doc.to_dict()
+            
+            if check_password_hash(user_data['password_hash'], password):
+                # Store user info in session
+                session['user_id'] = user_doc.id
+                session['username'] = user_data['username']
+                session['role'] = user_data['role']
+                session['worker_id'] = user_data.get('worker_id')
+                
+                flash('Login successful!', 'success')
+                return redirect(url_for('dashboard'))
+        
+        flash('Invalid credentials', 'error')
+    
+    return render_template('login.html')
+
+@app.route('/dashboard')
+@login_required
+def dashboard():
+    if session['role'] == 'worker':
+        return redirect(url_for('worker_dashboard'))
+    else:
+        return redirect(url_for('manager_dashboard'))
+
+@app.route('/worker/dashboard')
+@role_required('worker')
+def worker_dashboard():
+    try:
+        worker_id = session.get('worker_id')
+        if not worker_id:
+            flash('Worker ID not found', 'error')
+            return redirect(url_for('logout'))
+        
+        # Get worker details
+        worker_ref = db.collection('workers').document(worker_id)
+        worker_doc = worker_ref.get()
+        
+        if not worker_doc.exists:
+            flash('Worker not found', 'error')
+            return redirect(url_for('logout'))
+        
+        worker = worker_doc.to_dict()
+        worker['worker_id'] = worker_id
+        
+        # Get latest log
+        logs_ref = db.collection('helmet_logs')
+        latest_log_query = logs_ref.where('worker_id', '==', worker_id)\
+                                  .order_by('timestamp', direction=firestore.Query.DESCENDING)\
+                                  .limit(1).get()
+        
+        latest_log = None
+        if latest_log_query:
+            latest_log = latest_log_query[0].to_dict()
+        
+        # Get today's hours
+        today_hours = WorkSessionTracker.get_worker_hours(worker_id, 'today')
+        
+        # Get recent alerts
+        alerts_ref = db.collection('alerts')
+        recent_alerts_query = alerts_ref.where('worker_id', '==', worker_id)\
+                                       .order_by('timestamp', direction=firestore.Query.DESCENDING)\
+                                       .limit(5).get()
+        
+        recent_alerts = []
+        for alert in recent_alerts_query:
+            alert_data = alert.to_dict()
+            alert_data['id'] = alert.id
+            recent_alerts.append(alert_data)
+        
+        return render_template('Worker_dashboard.html',
+                             worker=worker,
+                             latest_log=latest_log,
+                             today_hours=today_hours,
+                             recent_alerts=recent_alerts)
+        
+    except Exception as e:
+        flash(f'Error loading dashboard: {str(e)}', 'error')
+        return redirect(url_for('logout'))
+
+@app.route('/manager/dashboard')
+@role_required('manager')
+def manager_dashboard():
+    try:
+        # Get all workers
+        workers_ref = db.collection('workers')
+        workers_docs = workers_ref.get()
+        
+        workers = []
+        for worker_doc in workers_docs:
+            worker = worker_doc.to_dict()
+            worker['worker_id'] = worker_doc.id
+            
+            # Get latest log
+            logs_ref = db.collection('helmet_logs')
+            latest_log_query = logs_ref.where('worker_id', '==', worker_doc.id)\
+                                      .order_by('timestamp', direction=firestore.Query.DESCENDING)\
+                                      .limit(1).get()
+            
+            if latest_log_query:
+                latest_log = latest_log_query[0].to_dict()
+                risk_level = RiskEngine.get_risk_level(latest_log.get('risk_score', 0))[0]
+                worker.update({
+                    'risk_score': latest_log.get('risk_score', 0),
+                    'risk_level': risk_level,
+                    'last_update': latest_log.get('timestamp'),
+                    'is_active': latest_log.get('helmet_worn', False)
+                })
+            else:
+                worker.update({
+                    'risk_score': 0,
+                    'risk_level': 'inactive',
+                    'last_update': None,
+                    'is_active': False
+                })
+            
+            # Get today's hours
+            worker['today_hours'] = WorkSessionTracker.get_worker_hours(worker_doc.id, 'today')
+            workers.append(worker)
+        
+        # Get unacknowledged alerts
+        alerts_ref = db.collection('alerts')
+        unacknowledged_alerts_query = alerts_ref.where('acknowledged', '==', False)\
+                                               .order_by('timestamp', direction=firestore.Query.DESCENDING)\
+                                               .limit(10).get()
+        
+        alerts = []
+        for alert in unacknowledged_alerts_query:
+            alert_data = alert.to_dict()
+            alert_data['id'] = alert.id
+            alerts.append(alert_data)
+        
+        return render_template('Manager_dashboard.html',
+                             workers=workers,
+                             alerts=alerts)
+        
+    except Exception as e:
+        flash(f'Error loading dashboard: {str(e)}', 'error')
+        return render_template('Manager_dashboard.html', workers=[], alerts=[])
+
+@app.route('/reports')
+@role_required('manager')
+def reports():
+    today = datetime.now().strftime('%Y-%m-%d')
+    return render_template('Reports.html', today=today)
+
+@app.route('/alerts')
+@login_required
+def alerts_page():
+    return render_template('Alert.html')
+
+# API Endpoints
+@app.route('/api/helmet/data', methods=['POST'])
+def receive_helmet_data():
+    try:
+        data = request.get_json()
+        
+        # Validate required fields
+        required_fields = ['worker_id', 'helmet_id', 'helmet_worn', 'gas', 'temperature', 'fall']
+        for field in required_fields:
+            if field not in data:
+                return jsonify({'error': f'Missing field: {field}'}), 400
+        
+        # Convert types
+        worker_id = str(data['worker_id'])
+        helmet_id = str(data['helmet_id'])
+        helmet_worn = bool(data['helmet_worn'])
+        gas = int(data['gas'])
+        temperature = float(data['temperature'])
+        fall = bool(data['fall'])
+        
+        # Calculate risk score
+        risk_score, alerts = RiskEngine.calculate_risk({
+            'gas': gas,
+            'temperature': temperature,
+            'helmet_worn': helmet_worn,
+            'fall': fall
+        })
+        
+        # Create helmet log
+        log_data = {
+            'worker_id': worker_id,
+            'helmet_id': helmet_id,
+            'gas': gas,
+            'temperature': temperature,
+            'helmet_worn': helmet_worn,
+            'fall': fall,
+            'risk_score': risk_score,
+            'battery': data.get('battery', 0.0),
+            'timestamp': datetime.now()
+        }
+        
+        db.collection('helmet_logs').add(log_data)
+        
+        # Handle work session tracking
+        WorkSessionTracker.handle_helmet_status(worker_id, helmet_worn)
+        
+        # Check for alerts
+        if risk_score >= Config.RISK_WARNING and alerts:
+            AlertSystem.create_alert(worker_id, helmet_id, risk_score, alerts)
+        
+        # Determine buzzer status
+        buzzer_status = "ON" if risk_score >= Config.RISK_WARNING else "OFF"
+        
+        return jsonify({
+            'status': 'success',
+            'risk_score': risk_score,
+            'risk_level': RiskEngine.get_risk_level(risk_score)[0],
+            'buzzer': buzzer_status
+        }), 200
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/worker/status')
+@role_required('worker')
+def get_worker_status():
+    try:
+        worker_id = session.get('worker_id')
+        
+        if not worker_id:
+            return jsonify({'error': 'Worker not found'}), 404
+        
+        # Get latest log
+        logs_ref = db.collection('helmet_logs')
+        latest_log_query = logs_ref.where('worker_id', '==', worker_id)\
+                                  .order_by('timestamp', direction=firestore.Query.DESCENDING)\
+                                  .limit(1).get()
+        
+        if not latest_log_query:
+            return jsonify({
+                'status': 'offline',
+                'message': 'No helmet data available'
+            }), 200
+        
+        latest_log = latest_log_query[0].to_dict()
+        risk_level, color = RiskEngine.get_risk_level(latest_log.get('risk_score', 0))
+        
+        # Convert datetime to ISO format
+        last_update = latest_log.get('timestamp')
+        if isinstance(last_update, datetime):
+            last_update = last_update.isoformat()
+        
+        return jsonify({
+            'worker_id': worker_id,
+            'helmet_worn': latest_log.get('helmet_worn', False),
+            'gas': latest_log.get('gas', 0),
+            'temperature': latest_log.get('temperature', 0),
+            'fall': latest_log.get('fall', False),
+            'risk_score': latest_log.get('risk_score', 0),
+            'risk_level': risk_level,
+            'battery': latest_log.get('battery', 0.0),
+            'last_update': last_update,
+            'today_hours': WorkSessionTracker.get_worker_hours(worker_id, 'today')
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/manager/workers')
+@role_required('manager')
+def get_all_workers():
+    try:
+        workers_ref = db.collection('workers')
+        workers_docs = workers_ref.get()
+        
+        result = []
+        for worker_doc in workers_docs:
+            worker_data = worker_doc.to_dict()
+            worker_data['worker_id'] = worker_doc.id
+            
+            # Get latest log
+            logs_ref = db.collection('helmet_logs')
+            latest_log_query = logs_ref.where('worker_id', '==', worker_doc.id)\
+                                      .order_by('timestamp', direction=firestore.Query.DESCENDING)\
+                                      .limit(1).get()
+            
+            if latest_log_query:
+                latest_log = latest_log_query[0].to_dict()
+                risk_level, color = RiskEngine.get_risk_level(latest_log.get('risk_score', 0))
+                
+                # Convert datetime to ISO format
+                last_update = latest_log.get('timestamp')
+                if isinstance(last_update, datetime):
+                    last_update = last_update.isoformat()
+                
+                worker_data.update({
+                    'gas': latest_log.get('gas', 0),
+                    'temperature': latest_log.get('temperature', 0),
+                    'helmet_worn': latest_log.get('helmet_worn', False),
+                    'risk_score': latest_log.get('risk_score', 0),
+                    'risk_level': risk_level,
+                    'last_update': last_update,
+                    'is_active': latest_log.get('helmet_worn', False)
+                })
+            
+            # Get work hours
+            worker_data['today_hours'] = WorkSessionTracker.get_worker_hours(worker_doc.id, 'today')
+            worker_data['week_hours'] = WorkSessionTracker.get_worker_hours(worker_doc.id, 'week')
+            worker_data['month_hours'] = WorkSessionTracker.get_worker_hours(worker_doc.id, 'month')
+            
+            result.append(worker_data)
+        
+        return jsonify(result)
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/alerts')
+@login_required
+def get_alerts():
+    try:
+        alerts_ref = db.collection('alerts')
+        
+        if session['role'] == 'worker':
+            worker_id = session.get('worker_id')
+            if worker_id:
+                alerts_query = alerts_ref.where('worker_id', '==', worker_id)
+            else:
+                return jsonify([])
+        else:
+            alerts_query = alerts_ref
+        
+        alerts_docs = alerts_query.order_by('timestamp', direction=firestore.Query.DESCENDING)\
+                                 .limit(100).get()
+        
+        result = []
+        for alert in alerts_docs:
+            alert_data = alert.to_dict()
+            alert_data['id'] = alert.id
+            
+            # Convert datetime to ISO format
+            timestamp = alert_data.get('timestamp')
+            if isinstance(timestamp, datetime):
+                alert_data['timestamp'] = timestamp.isoformat()
+            
+            # Calculate time ago
+            if timestamp:
+                now = datetime.now()
+                if isinstance(timestamp, str):
+                    timestamp = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                
+                diff = now - timestamp
+                if diff.days > 0:
+                    alert_data['time_ago'] = f"{diff.days} days ago"
+                elif diff.seconds > 3600:
+                    hours = diff.seconds // 3600
+                    alert_data['time_ago'] = f"{hours} hours ago"
+                elif diff.seconds > 60:
+                    minutes = diff.seconds // 60
+                    alert_data['time_ago'] = f"{minutes} minutes ago"
+                else:
+                    alert_data['time_ago'] = "Just now"
+            
+            result.append(alert_data)
+        
+        return jsonify(result)
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/alerts/<alert_id>/acknowledge', methods=['POST'])
+@role_required('manager')
+def acknowledge_alert(alert_id):
+    try:
+        alert_ref = db.collection('alerts').document(alert_id)
+        alert_doc = alert_ref.get()
+        
+        if not alert_doc.exists:
+            return jsonify({'error': 'Alert not found'}), 404
+        
+        alert_ref.update({
+            'acknowledged': True,
+            'acknowledged_by': session['username'],
+            'acknowledged_at': datetime.now()
+        })
+        
+        return jsonify({'status': 'success'})
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/reports/daily')
+@role_required('manager')
+def get_daily_report():
+    try:
+        today = datetime.now().date()
+        start_date = datetime(today.year, today.month, today.day)
+        end_date = start_date + timedelta(days=1)
+        
+        # Get all logs for today
+        logs_ref = db.collection('helmet_logs')
+        logs_query = logs_ref.where('timestamp', '>=', start_date)\
+                            .where('timestamp', '<', end_date).get()
+        
+        # Get all workers
+        workers_ref = db.collection('workers')
+        workers_docs = workers_ref.get()
+        
+        # Get all alerts for today
+        alerts_ref = db.collection('alerts')
+        alerts_query = alerts_ref.where('timestamp', '>=', start_date)\
+                                .where('timestamp', '<', end_date).get()
+        
+        # Get all sessions for today
+        sessions_ref = db.collection('work_sessions')
+        sessions_query = sessions_ref.where('start_time', '>=', start_date)\
+                                    .where('start_time', '<', end_date)\
+                                    .where('is_completed', '==', True).get()
+        
+        # Calculate statistics
+        total_workers = len(workers_docs)
+        
+        # Count active workers (with helmet on in last 5 minutes)
+        five_min_ago = datetime.now() - timedelta(minutes=5)
+        active_workers_query = logs_ref.where('timestamp', '>=', five_min_ago)\
+                                      .where('helmet_worn', '==', True).get()
+        active_worker_ids = set()
+        for log in active_workers_query:
+            log_data = log.to_dict()
+            active_worker_ids.add(log_data['worker_id'])
+        
+        active_workers = len(active_worker_ids)
+        
+        # Count high risk incidents
+        high_risk_incidents = 0
+        total_risk_score = 0
+        for log in logs_query:
+            log_data = log.to_dict()
+            if log_data.get('risk_score', 0) >= Config.RISK_WARNING:
+                high_risk_incidents += 1
+            total_risk_score += log_data.get('risk_score', 0)
+        
+        total_alerts = len(alerts_query)
+        
+        # Calculate total work hours
+        total_work_seconds = 0
+        for session in sessions_query:
+            session_data = session.to_dict()
+            if session_data.get('duration'):
+                total_work_seconds += session_data['duration']
+        
+        total_work_hours = total_work_seconds / 3600
+        
+        # Calculate average risk score
+        average_risk_score = total_risk_score / len(logs_query) if logs_query else 0
+        
+        report = {
+            'date': today.isoformat(),
+            'total_workers': total_workers,
+            'active_workers': active_workers,
+            'high_risk_incidents': high_risk_incidents,
+            'total_alerts': total_alerts,
+            'total_work_hours': round(total_work_hours, 2),
+            'average_risk_score': round(average_risk_score, 2)
+        }
+        
+        return jsonify(report)
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/worker/sos', methods=['POST'])
+@role_required('worker')
+def send_sos():
+    try:
+        worker_id = session.get('worker_id')
+        
+        if not worker_id:
+            return jsonify({'error': 'Worker not found'}), 404
+        
+        # Get worker details
+        worker_ref = db.collection('workers').document(worker_id)
+        worker_doc = worker_ref.get()
+        
+        if not worker_doc.exists:
+            return jsonify({'error': 'Worker not found'}), 404
+        
+        worker_data = worker_doc.to_dict()
+        
+        # Create SOS alert
+        sos_alert = {
+            'worker_id': worker_id,
+            'helmet_id': worker_data.get('helmet_id', 'UNKNOWN'),
+            'alert_type': 'sos',
+            'risk_score': 100,
+            'message': 'EMERGENCY SOS: Worker requested immediate assistance!',
+            'timestamp': datetime.now(),
+            'acknowledged': False,
+            'acknowledged_by': None,
+            'acknowledged_at': None,
+            'worker_name': worker_data.get('name', 'Unknown')
+        }
+        
+        db.collection('alerts').add(sos_alert)
+        
+        # Send Telegram alert
+        alert_message = f"🚨🚨🚨 <b>EMERGENCY SOS</b> 🚨🚨🚨\n"
+        alert_message += f"Worker: {worker_data.get('name', 'Unknown')}\n"
+        alert_message += f"ID: {worker_id}\n"
+        alert_message += f"Location: Unknown\n"
+        alert_message += f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        alert_message += f"<b>IMMEDIATE ASSISTANCE REQUIRED!</b>"
+        
+        # Send to manager
+        users_ref = db.collection('users')
+        manager_query = users_ref.where('role', '==', 'manager').limit(1).get()
+        for manager in manager_query:
+            manager_data = manager.to_dict()
+            if manager_data.get('telegram_id'):
+                AlertSystem.send_telegram_alert(manager_data['telegram_id'], alert_message)
+        
+        return jsonify({'status': 'success', 'message': 'SOS alert sent!'})
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/manager/broadcast', methods=['POST'])
+@role_required('manager')
+def broadcast_alert():
+    try:
+        data = request.get_json()
+        message = data.get('message', '')
+        
+        if not message:
+            return jsonify({'error': 'Message is required'}), 400
+        
+        # Create broadcast alert for all workers
+        workers_ref = db.collection('workers')
+        workers_docs = workers_ref.get()
+        
+        for worker_doc in workers_docs:
+            worker_data = worker_doc.to_dict()
+            
+            broadcast_alert = {
+                'worker_id': worker_doc.id,
+                'helmet_id': worker_data.get('helmet_id', 'UNKNOWN'),
+                'alert_type': 'broadcast',
+                'risk_score': 50,
+                'message': f'MANAGER BROADCAST: {message}',
+                'timestamp': datetime.now(),
+                'acknowledged': False,
+                'worker_name': worker_data.get('name', 'Unknown')
+            }
+            
+            db.collection('alerts').add(broadcast_alert)
+        
+        return jsonify({'status': 'success', 'message': 'Broadcast sent to all workers!'})
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    flash('Logged out successfully', 'success')
+    return redirect(url_for('login'))
+
+# Initialize default data
+def initialize_default_data():
+    try:
+        # Check if users exist
+        users_ref = db.collection('users')
+        users = users_ref.limit(1).get()
+        
+        if not users:
+            print("Creating default users...")
+            
+            # Create manager
+            manager_data = {
+                'username': 'manager',
+                'password_hash': generate_password_hash('manager123'),
+                'role': 'manager',
+                'telegram_id': Config.MANAGER_CHAT_ID,
+                'created_at': datetime.now()
+            }
+            users_ref.add(manager_data)
+            
+            # Create sample workers
+            sample_workers = [
+                {
+                    'worker_id': 'WKR001',
+                    'name': 'John Smith',
+                    'helmet_id': 'HLM001',
+                    'department': 'Construction',
+                    'phone': '+1234567890',
+                    'is_active': True,
+                    'created_at': datetime.now()
+                },
+                {
+                    'worker_id': 'WKR002',
+                    'name': 'Emma Wilson',
+                    'helmet_id': 'HLM002',
+                    'department': 'Mining',
+                    'phone': '+1234567891',
+                    'is_active': True,
+                    'created_at': datetime.now()
+                },
+                {
+                    'worker_id': 'WKR003',
+                    'name': 'David Lee',
+                    'helmet_id': 'HLM003',
+                    'department': 'Manufacturing',
+                    'phone': '+1234567892',
+                    'is_active': True,
+                    'created_at': datetime.now()
+                },
+                {
+                    'worker_id': 'WKR004',
+                    'name': 'Sarah Johnson',
+                    'helmet_id': 'HLM004',
+                    'department': 'Warehouse',
+                    'phone': '+1234567893',
+                    'is_active': True,
+                    'created_at': datetime.now()
+                }
+            ]
+            
+            workers_ref = db.collection('workers')
+            for worker in sample_workers:
+                # Check if worker exists
+                worker_doc = workers_ref.document(worker['worker_id']).get()
+                if not worker_doc.exists:
+                    workers_ref.document(worker['worker_id']).set(worker)
+                    
+                    # Create worker user account
+                    user_data = {
+                        'username': f'worker{worker["worker_id"][-3:]}',
+                        'password_hash': generate_password_hash('worker123'),
+                        'role': 'worker',
+                        'worker_id': worker['worker_id'],
+                        'telegram_id': f'WORKER_{worker["worker_id"]}',
+                        'created_at': datetime.now()
+                    }
+                    users_ref.add(user_data)
+            
+            print("Default data created successfully!")
+            
+    except Exception as e:
+        print(f"Error initializing default data: {e}")
+
+# Create templates directory and HTML files
+def create_templates():
+    templates_dir = 'templates'
+    if not os.path.exists(templates_dir):
+        os.makedirs(templates_dir)
+    
+    # Create Base.html
+    base_html = '''<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -15,11 +952,6 @@
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
     
     <!-- Custom CSS -->
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
-    
-    <!-- Chart.js -->
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    
     <style>
         :root {
             --primary-color: #2c3e50;
@@ -191,7 +1123,7 @@
                 <a href="#">
                     <i class="fas fa-clock"></i> Working Hours
                 </a>
-                <a href="#">
+                <a href="{{ url_for('alerts_page') }}">
                     <i class="fas fa-bell"></i> Alerts
                 </a>
                 
@@ -203,10 +1135,10 @@
                 <a href="#">
                     <i class="fas fa-users"></i> All Workers
                 </a>
-                <a href="#">
+                <a href="{{ url_for('alerts_page') }}">
                     <i class="fas fa-exclamation-triangle"></i> Alerts
                 </a>
-                <a href="#">
+                <a href="{{ url_for('reports') }}">
                     <i class="fas fa-chart-bar"></i> Reports
                 </a>
                 <a href="#">
@@ -243,16 +1175,15 @@
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
     
     <!-- Custom JS -->
-    <script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
-    
     {% block scripts %}{% endblock %}
 </body>
-</html>
-
-<!-- ============================ -->
-<!-- FILE: Login.html -->
-<!-- ============================ -->
-{% extends "base.html" %}
+</html>'''
+    
+    with open(os.path.join(templates_dir, 'base.html'), 'w') as f:
+        f.write(base_html)
+    
+    # Create Login.html
+    login_html = '''{% extends "base.html" %}
 
 {% block title %}Login{% endblock %}
 
@@ -318,12 +1249,14 @@
         </div>
     </div>
 </div>
-{% endblock %}
-
-<!-- ============================ -->
-<!-- FILE: Worker_dashboard.html -->
-<!-- ============================ -->
-{% extends "base.html" %}
+{% endblock %}'''
+    
+    with open(os.path.join(templates_dir, 'login.html'), 'w') as f:
+        f.write(login_html)
+    
+    # Copy other HTML files from the provided content
+    html_files = {
+        'Worker_dashboard.html': '''{% extends "base.html" %}
 
 {% block title %}Worker Dashboard{% endblock %}
 
@@ -705,6 +1638,7 @@
             .then(response => response.json())
             .then(data => {
                 alert('SOS Alert Sent! Manager has been notified.');
+                location.reload();
             })
             .catch(error => {
                 alert('Error sending SOS alert. Please try again.');
@@ -712,12 +1646,9 @@
         }
     }
 </script>
-{% endblock %}
-
-<!-- ============================ -->
-<!-- FILE: Manager_dashboard.html -->
-<!-- ============================ -->
-{% extends "base.html" %}
+{% endblock %}''',
+        
+        'Manager_dashboard.html': '''{% extends "base.html" %}
 
 {% block title %}Manager Dashboard{% endblock %}
 
@@ -893,7 +1824,7 @@
                         <div class="d-flex justify-content-between align-items-start">
                             <div>
                                 <h6 class="alert-heading">
-                                    <i class="fas fa-exclamation-circle"></i> {{ alert.worker.name }}
+                                    <i class="fas fa-exclamation-circle"></i> {{ alert.worker_name }}
                                 </h6>
                                 <p class="mb-1">{{ alert.message }}</p>
                                 <small class="text-muted">
@@ -902,7 +1833,7 @@
                                 </small>
                             </div>
                             <button type="button" class="btn-close" data-bs-dismiss="alert" 
-                                    onclick="acknowledgeAlert({{ alert.id }})"></button>
+                                    onclick="acknowledgeAlert('{{ alert.id }}')"></button>
                         </div>
                     </div>
                     {% endfor %}
@@ -1011,6 +1942,7 @@
 {% endblock %}
 
 {% block scripts %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <script>
     // Initialize charts
     document.addEventListener('DOMContentLoaded', function() {
@@ -1070,42 +2002,36 @@
     });
     
     function viewWorkerDetails(workerId) {
-        window.location.href = `/worker/${workerId}/details`;
+        // Implement view worker details
+        alert('View details for worker: ' + workerId);
     }
     
     function acknowledgeAlert(alertId) {
-        fetch(`/api/alerts/${alertId}/acknowledge`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-            }
-        })
-        .then(response => response.json())
-        .then(data => {
-            if(data.status === 'success') {
-                location.reload();
-            }
-        });
+        if(confirm('Mark this alert as acknowledged?')) {
+            fetch('/api/alerts/' + alertId + '/acknowledge', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                }
+            })
+            .then(response => response.json())
+            .then(data => {
+                if(data.status === 'success') {
+                    location.reload();
+                }
+            });
+        }
     }
     
     function sendAlert(workerId) {
-        fetch(`/api/manager/alert/${workerId}`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-                message: 'Manager Alert: Please check your safety status immediately!'
-            })
-        })
-        .then(response => response.json())
-        .then(data => {
+        const message = prompt('Enter alert message for worker ' + workerId + ':');
+        if(message) {
             alert('Alert sent to worker!');
-        });
+        }
     }
     
     function generateReport() {
-        window.open('/api/reports/daily/pdf', '_blank');
+        window.open('/api/reports/daily', '_blank');
     }
     
     function sendAllAlert() {
@@ -1126,7 +2052,7 @@
     }
     
     function viewAllReports() {
-        window.location.href = '/manager/reports';
+        window.location.href = '/reports';
     }
     
     // Auto-refresh dashboard every 30 seconds
@@ -1138,12 +2064,9 @@
             });
     }, 30000);
 </script>
-{% endblock %}
-
-<!-- ============================ -->
-<!-- FILE: Reports.html -->
-<!-- ============================ -->
-{% extends "base.html" %}
+{% endblock %}''',
+        
+        'Reports.html': '''{% extends "base.html" %}
 
 {% block title %}Reports & Analytics{% endblock %}
 
@@ -1456,7 +2379,7 @@
         `;
         
         // Fetch report data
-        fetch(`/api/reports/daily?from=${fromDate}&to=${toDate}&department=${department}`)
+        fetch(\`/api/reports/daily?from=\${fromDate}&to=\${toDate}&department=\${department}\`)
             .then(response => response.json())
             .then(data => {
                 reportData = data;
@@ -1491,7 +2414,7 @@
     function formatChange(change) {
         if (!change) return '0% vs last period';
         const sign = change >= 0 ? '+' : '';
-        return `${sign}${change}% vs last period`;
+        return \`\${sign}\${change}% vs last period\`;
     }
 
     // Update charts
@@ -1598,7 +2521,7 @@
                                 const total = context.dataset.data.reduce((a, b) => a + b, 0);
                                 const value = context.raw;
                                 const percentage = Math.round((value / total) * 100);
-                                return `${context.label}: ${value} (${percentage}%)`;
+                                return \`\${context.label}: \${value} (\${percentage}%)\`;
                             }
                         }
                     }
@@ -1674,7 +2597,7 @@
         let html = '';
         
         if (workers.length === 0) {
-            html = `
+            html = \`
                 <tr>
                     <td colspan="8" class="text-center py-5">
                         <div class="mb-3" style="font-size: 3em; color: #ccc;">
@@ -1684,58 +2607,58 @@
                         <p class="text-muted">Try adjusting your date range or filters.</p>
                     </td>
                 </tr>
-            `;
+            \`;
         } else {
             workers.forEach(worker => {
                 // Calculate safety score (0-100)
                 const safetyScore = calculateSafetyScore(worker);
                 
-                html += `
-                <tr onclick="showWorkerDetails('${worker.worker_id}')" style="cursor: pointer;">
+                html += \`
+                <tr onclick="showWorkerDetails('\${worker.worker_id}')" style="cursor: pointer;">
                     <td>
-                        <strong>${worker.name}</strong><br>
-                        <small class="text-muted">${worker.worker_id}</small>
+                        <strong>\${worker.name}</strong><br>
+                        <small class="text-muted">\${worker.worker_id}</small>
                     </td>
-                    <td>${worker.department}</td>
+                    <td>\${worker.department}</td>
                     <td>
                         <div class="progress" style="height: 20px;">
-                            <div class="progress-bar bg-primary" style="width: ${Math.min(worker.hours / 8 * 100, 100)}%">
-                                ${worker.hours}h
+                            <div class="progress-bar bg-primary" style="width: \${Math.min(worker.hours / 8 * 100, 100)}%">
+                                \${worker.hours}h
                             </div>
                         </div>
                     </td>
                     <td>
-                        <span class="badge ${getRiskBadgeClass(worker.avg_risk)}">
-                            ${worker.avg_risk.toFixed(1)}
+                        <span class="badge \${getRiskBadgeClass(worker.avg_risk)}">
+                            \${worker.avg_risk.toFixed(1)}
                         </span>
                     </td>
                     <td>
-                        ${worker.alerts}
-                        ${worker.alerts > 0 ? `<span class="badge bg-danger ms-1">${worker.high_risk_alerts}</span>` : ''}
+                        \${worker.alerts}
+                        \${worker.alerts > 0 ? \`<span class="badge bg-danger ms-1">\${worker.high_risk_alerts}</span>\` : ''}
                     </td>
                     <td>
                         <div class="progress" style="height: 20px;">
-                            <div class="progress-bar ${worker.helmet_usage > 90 ? 'bg-success' : 'bg-warning'}" 
-                                 style="width: ${worker.helmet_usage}%">
-                                ${worker.helmet_usage}%
+                            <div class="progress-bar \${worker.helmet_usage > 90 ? 'bg-success' : 'bg-warning'}" 
+                                 style="width: \${worker.helmet_usage}%">
+                                \${worker.helmet_usage}%
                             </div>
                         </div>
                     </td>
                     <td>
                         <div class="progress" style="height: 20px;">
-                            <div class="progress-bar ${safetyScore > 80 ? 'bg-success' : safetyScore > 60 ? 'bg-warning' : 'bg-danger'}" 
-                                 style="width: ${safetyScore}%">
-                                ${safetyScore}%
+                            <div class="progress-bar \${safetyScore > 80 ? 'bg-success' : safetyScore > 60 ? 'bg-warning' : 'bg-danger'}" 
+                                 style="width: \${safetyScore}%">
+                                \${safetyScore}%
                             </div>
                         </div>
                     </td>
                     <td>
-                        <button class="btn btn-sm btn-outline-primary" onclick="event.stopPropagation(); showWorkerDetails('${worker.worker_id}')">
+                        <button class="btn btn-sm btn-outline-primary" onclick="event.stopPropagation(); showWorkerDetails('\${worker.worker_id}')">
                             <i class="fas fa-chart-bar"></i>
                         </button>
                     </td>
                 </tr>
-                `;
+                \`;
             });
         }
         
@@ -1774,29 +2697,29 @@
         
         const details = reportData.worker_details?.[workerId] || {};
         
-        let content = `
+        let content = \`
             <div class="card">
                 <div class="card-header">
-                    <h5 class="mb-0">${worker.name} - Performance Details</h5>
+                    <h5 class="mb-0">\${worker.name} - Performance Details</h5>
                 </div>
                 <div class="card-body">
                     <div class="row">
                         <div class="col-md-6">
                             <h6>Basic Info</h6>
                             <table class="table table-sm">
-                                <tr><td>Worker ID:</td><td>${worker.worker_id}</td></tr>
-                                <tr><td>Department:</td><td>${worker.department}</td></tr>
-                                <tr><td>Helmet ID:</td><td>${worker.helmet_id}</td></tr>
-                                <tr><td>Work Sessions:</td><td>${worker.sessions}</td></tr>
+                                <tr><td>Worker ID:</td><td>\${worker.worker_id}</td></tr>
+                                <tr><td>Department:</td><td>\${worker.department}</td></tr>
+                                <tr><td>Helmet ID:</td><td>\${worker.helmet_id}</td></tr>
+                                <tr><td>Work Sessions:</td><td>\${worker.sessions}</td></tr>
                             </table>
                         </div>
                         <div class="col-md-6">
                             <h6>Performance Metrics</h6>
                             <table class="table table-sm">
-                                <tr><td>Total Hours:</td><td>${worker.hours} hours</td></tr>
-                                <tr><td>Avg Session:</td><td>${(worker.hours / worker.sessions).toFixed(1)} hours</td></tr>
-                                <tr><td>Helmet Usage:</td><td>${worker.helmet_usage}%</td></tr>
-                                <tr><td>Safety Score:</td><td>${calculateSafetyScore(worker)}%</td></tr>
+                                <tr><td>Total Hours:</td><td>\${worker.hours} hours</td></tr>
+                                <tr><td>Avg Session:</td><td>\${(worker.hours / worker.sessions).toFixed(1)} hours</td></tr>
+                                <tr><td>Helmet Usage:</td><td>\${worker.helmet_usage}%</td></tr>
+                                <tr><td>Safety Score:</td><td>\${calculateSafetyScore(worker)}%</td></tr>
                             </table>
                         </div>
                     </div>
@@ -1808,7 +2731,7 @@
                                 <div class="card bg-danger text-white text-center">
                                     <div class="card-body">
                                         <h6>Total Alerts</h6>
-                                        <h3>${worker.alerts}</h3>
+                                        <h3>\${worker.alerts}</h3>
                                     </div>
                                 </div>
                             </div>
@@ -1816,7 +2739,7 @@
                                 <div class="card bg-warning text-white text-center">
                                     <div class="card-body">
                                         <h6>High Risk</h6>
-                                        <h3>${worker.high_risk_alerts}</h3>
+                                        <h3>\${worker.high_risk_alerts}</h3>
                                     </div>
                                 </div>
                             </div>
@@ -1824,7 +2747,7 @@
                                 <div class="card bg-info text-white text-center">
                                     <div class="card-body">
                                         <h6>Gas Alerts</h6>
-                                        <h3>${details.gas_alerts || 0}</h3>
+                                        <h3>\${details.gas_alerts || 0}</h3>
                                     </div>
                                 </div>
                             </div>
@@ -1832,7 +2755,7 @@
                                 <div class="card bg-secondary text-white text-center">
                                     <div class="card-body">
                                         <h6>Fall Alerts</h6>
-                                        <h3>${details.fall_alerts || 0}</h3>
+                                        <h3>\${details.fall_alerts || 0}</h3>
                                     </div>
                                 </div>
                             </div>
@@ -1841,13 +2764,13 @@
                     
                     <div class="mt-3">
                         <h6>Recommendations</h6>
-                        <div class="alert ${calculateSafetyScore(worker) > 80 ? 'alert-success' : calculateSafetyScore(worker) > 60 ? 'alert-warning' : 'alert-danger'}">
-                            ${generateRecommendations(worker)}
+                        <div class="alert \${calculateSafetyScore(worker) > 80 ? 'alert-success' : calculateSafetyScore(worker) > 60 ? 'alert-warning' : 'alert-danger'}">
+                            \${generateRecommendations(worker)}
                         </div>
                     </div>
                 </div>
             </div>
-        `;
+        \`;
         
         document.getElementById('detailsContent').innerHTML = content;
         document.getElementById('workerDetails').classList.remove('d-none');
@@ -1900,33 +2823,33 @@
         // Update alert types
         let alertTypesHtml = '';
         alertTypes.forEach((type, index) => {
-            alertTypesHtml += `
+            alertTypesHtml += \`
                 <div class="d-flex justify-content-between align-items-center mb-2">
                     <span>
-                        <span class="badge ${getAlertTypeBadge(type.type)} me-2">${type.type}</span>
-                        ${type.count} alerts
+                        <span class="badge \${getAlertTypeBadge(type.type)} me-2">\${type.type}</span>
+                        \${type.count} alerts
                     </span>
-                    <span class="text-muted">${type.percentage}%</span>
+                    <span class="text-muted">\${type.percentage}%</span>
                 </div>
                 <div class="progress mb-3" style="height: 10px;">
-                    <div class="progress-bar ${getAlertTypeBadge(type.type)}" style="width: ${type.percentage}%"></div>
+                    <div class="progress-bar \${getAlertTypeBadge(type.type)}" style="width: \${type.percentage}%"></div>
                 </div>
-            `;
+            \`;
         });
         document.getElementById('alertTypesList').innerHTML = alertTypesHtml;
         
         // Update peak times
         let peakTimesHtml = '';
         peakTimes.forEach(time => {
-            peakTimesHtml += `
+            peakTimesHtml += \`
                 <div class="d-flex justify-content-between align-items-center mb-2">
                     <span>
                         <i class="fas fa-clock me-2"></i>
-                        ${time.hour}:00 - ${time.hour}:59
+                        \${time.hour}:00 - \${time.hour}:59
                     </span>
-                    <span class="badge bg-danger">${time.count} alerts</span>
+                    <span class="badge bg-danger">\${time.count} alerts</span>
                 </div>
-            `;
+            \`;
         });
         document.getElementById('peakTimesList').innerHTML = peakTimesHtml;
     }
@@ -1955,10 +2878,10 @@
         
         // In a real implementation, this would call your backend to generate the report
         // For now, we'll simulate it
-        showToast(`Report generation started. This might take a moment...`, 'info');
+        showToast(\`Report generation started. This might take a moment...\`, 'info');
         
         setTimeout(() => {
-            showToast(`Report generated successfully!`, 'success');
+            showToast(\`Report generated successfully!\`, 'success');
             const modal = bootstrap.Modal.getInstance(document.getElementById('reportModal'));
             modal.hide();
             
@@ -1977,10 +2900,10 @@
         }
         
         // Create CSV content
-        let csv = 'Worker ID,Name,Department,Work Hours,Avg Risk Score,Alerts,High Risk Alerts,Helmet Usage,Safety Score\n';
+        let csv = 'Worker ID,Name,Department,Work Hours,Avg Risk Score,Alerts,High Risk Alerts,Helmet Usage,Safety Score\\n';
         
         workers.forEach(worker => {
-            csv += `"${worker.worker_id}","${worker.name}","${worker.department}",${worker.hours},${worker.avg_risk},${worker.alerts},${worker.high_risk_alerts},${worker.helmet_usage},${calculateSafetyScore(worker)}\n`;
+            csv += \`"\${worker.worker_id}","\${worker.name}","\${worker.department}",\${worker.hours},\${worker.avg_risk},\${worker.alerts},\${worker.high_risk_alerts},\${worker.helmet_usage},\${calculateSafetyScore(worker)}\\n\`;
         });
         
         // Create download link
@@ -1988,7 +2911,7 @@
         const url = window.URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
-        a.download = `safety_report_${new Date().toISOString().split('T')[0]}.csv`;
+        a.download = \`safety_report_\${new Date().toISOString().split('T')[0]}.csv\`;
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
@@ -2010,23 +2933,23 @@
         if (!toastContainer) {
             toastContainer = document.createElement('div');
             toastContainer.id = 'toastContainer';
-            toastContainer.style.cssText = `
+            toastContainer.style.cssText = \`
                 position: fixed;
                 top: 20px;
                 right: 20px;
                 z-index: 9999;
-            `;
+            \`;
             document.body.appendChild(toastContainer);
         }
         
         const toastId = 'toast-' + Date.now();
         const toast = document.createElement('div');
         toast.id = toastId;
-        toast.className = `alert alert-${type} alert-dismissible fade show`;
-        toast.innerHTML = `
-            ${message}
-            <button type="button" class="btn-close" onclick="document.getElementById('${toastId}').remove()"></button>
-        `;
+        toast.className = \`alert alert-\${type} alert-dismissible fade show\`;
+        toast.innerHTML = \`
+            \${message}
+            <button type="button" class="btn-close" onclick="document.getElementById('\${toastId}').remove()"></button>
+        \`;
         toast.style.cssText = 'margin-bottom: 10px; min-width: 250px;';
         
         toastContainer.appendChild(toast);
@@ -2038,12 +2961,9 @@
         }, 3000);
     }
 </script>
-{% endblock %}ll
-
-<!-- ============================ -->
-<!-- FILE: Alert.html -->
-<!-- ============================ -->
-{% extends "base.html" %}
+{% endblock %}''',
+        
+        'Alert.html': '''{% extends "base.html" %}
 
 {% block title %}Alert Management{% endblock %}
 
@@ -2283,14 +3203,14 @@
             })
             .catch(error => {
                 console.error('Error loading alerts:', error);
-                document.getElementById('alertsBody').innerHTML = `
+                document.getElementById('alertsBody').innerHTML = \`
                     <tr>
                         <td colspan="{% if session.role == 'manager' %}7{% else %}6{% endif %}" class="text-center py-5 text-danger">
                             <i class="fas fa-exclamation-circle fa-2x mb-3"></i>
                             <p>Failed to load alerts. Please try again.</p>
                         </td>
                     </tr>
-                `;
+                \`;
             });
     }
 
@@ -2303,7 +3223,7 @@
                 workers.forEach(worker => {
                     const option = document.createElement('option');
                     option.value = worker.worker_id;
-                    option.textContent = `${worker.name} (${worker.worker_id})`;
+                    option.textContent = \`\${worker.name} (\${worker.worker_id})\`;
                     select.appendChild(option);
                 });
             });
@@ -2320,7 +3240,7 @@
         document.getElementById('pendingAlerts').textContent = pending;
         document.getElementById('highRiskAlerts').textContent = highRisk;
         document.getElementById('resolvedAlerts').textContent = resolved;
-        document.getElementById('activeAlertCount').textContent = `${pending} Active`;
+        document.getElementById('activeAlertCount').textContent = \`\${pending} Active\`;
     }
 
     // Filter and display alerts
@@ -2417,52 +3337,52 @@
                 if (alert.risk_score > 60) riskBadgeClass = 'bg-danger';
                 else if (alert.risk_score > 30) riskBadgeClass = 'bg-warning';
                 
-                html += `
-                <tr class="{% if not alert.acknowledged %}alert-row{% endif %}" onclick="showAlertDetail(${alert.id})" style="cursor: pointer;">
+                html += \`
+                <tr class="{% if not alert.acknowledged %}alert-row{% endif %}" onclick="showAlertDetail('\${alert.id}')" style="cursor: pointer;">
                     {% if session.role == 'manager' %}
                     <td>
-                        <strong>${alert.worker_name || 'Unknown'}</strong><br>
-                        <small class="text-muted">${alert.worker_id}</small>
+                        <strong>\${alert.worker_name || 'Unknown'}</strong><br>
+                        <small class="text-muted">\${alert.worker_id}</small>
                     </td>
                     {% endif %}
                     <td>
-                        <strong>${timeStr}</strong><br>
-                        <small class="text-muted">${dateStr}</small><br>
-                        <small class="text-muted">${alert.time_ago}</small>
+                        <strong>\${timeStr}</strong><br>
+                        <small class="text-muted">\${dateStr}</small><br>
+                        <small class="text-muted">\${alert.time_ago}</small>
                     </td>
                     <td>
-                        <span class="badge ${typeBadgeClass}">
-                            <i class="fas ${typeIcon}"></i> ${alert.alert_type}
+                        <span class="badge \${typeBadgeClass}">
+                            <i class="fas \${typeIcon}"></i> \${alert.alert_type}
                         </span>
                     </td>
                     <td>
-                        <span class="badge ${riskBadgeClass}">
-                            ${alert.risk_score}
+                        <span class="badge \${riskBadgeClass}">
+                            \${alert.risk_score}
                         </span>
                     </td>
-                    <td>${alert.message}</td>
+                    <td>\${alert.message}</td>
                     <td>
-                        ${alert.acknowledged ? 
-                            `<span class="badge bg-success">
+                        \${alert.acknowledged ? 
+                            \`<span class="badge bg-success">
                                 <i class="fas fa-check"></i> Acknowledged
-                            </span>` : 
-                            `<span class="badge bg-warning">
+                            </span>\` : 
+                            \`<span class="badge bg-warning">
                                 <i class="fas fa-clock"></i> Pending
-                            </span>`
+                            </span>\`
                         }
                     </td>
                     <td>
-                        <button class="btn btn-sm btn-outline-primary" onclick="event.stopPropagation(); showAlertDetail(${alert.id})">
+                        <button class="btn btn-sm btn-outline-primary" onclick="event.stopPropagation(); showAlertDetail('\${alert.id}')">
                             <i class="fas fa-eye"></i>
                         </button>
                         {% if session.role == 'manager' and not alert.acknowledged %}
-                        <button class="btn btn-sm btn-success" onclick="event.stopPropagation(); acknowledgeSingle(${alert.id})">
+                        <button class="btn btn-sm btn-success" onclick="event.stopPropagation(); acknowledgeSingle('\${alert.id}')">
                             <i class="fas fa-check"></i>
                         </button>
                         {% endif %}
                     </td>
                 </tr>
-                `;
+                \`;
             });
         }
 
@@ -2477,32 +3397,32 @@
         
         // Previous button
         const prevLi = document.createElement('li');
-        prevLi.className = `page-item ${currentPage === 1 ? 'disabled' : ''}`;
-        prevLi.innerHTML = `
-            <a class="page-link" href="#" onclick="changePage(${currentPage - 1})">
+        prevLi.className = \`page-item \${currentPage === 1 ? 'disabled' : ''}\`;
+        prevLi.innerHTML = \`
+            <a class="page-link" href="#" onclick="changePage(\${currentPage - 1})">
                 <i class="fas fa-chevron-left"></i>
             </a>
-        `;
+        \`;
         pagination.appendChild(prevLi);
         
         // Page numbers
         for (let i = 1; i <= totalPages; i++) {
             const li = document.createElement('li');
-            li.className = `page-item ${i === currentPage ? 'active' : ''}`;
-            li.innerHTML = `
-                <a class="page-link" href="#" onclick="changePage(${i})">${i}</a>
-            `;
+            li.className = \`page-item \${i === currentPage ? 'active' : ''}\`;
+            li.innerHTML = \`
+                <a class="page-link" href="#" onclick="changePage(\${i})">\${i}</a>
+            \`;
             pagination.appendChild(li);
         }
         
         // Next button
         const nextLi = document.createElement('li');
-        nextLi.className = `page-item ${currentPage === totalPages ? 'disabled' : ''}`;
-        nextLi.innerHTML = `
-            <a class="page-link" href="#" onclick="changePage(${currentPage + 1})">
+        nextLi.className = \`page-item \${currentPage === totalPages ? 'disabled' : ''}\`;
+        nextLi.innerHTML = \`
+            <a class="page-link" href="#" onclick="changePage(\${currentPage + 1})">
                 <i class="fas fa-chevron-right"></i>
             </a>
-        `;
+        \`;
         pagination.appendChild(nextLi);
     }
 
@@ -2520,9 +3440,9 @@
         const modal = new bootstrap.Modal(document.getElementById('alertDetailModal'));
         const time = new Date(alert.timestamp);
         
-        let content = `
-            <div class="alert ${alert.acknowledged ? 'alert-success' : 'alert-danger'}">
-                <h5><i class="fas fa-exclamation-triangle"></i> ${alert.alert_type.toUpperCase()} ALERT</h5>
+        let content = \`
+            <div class="alert \${alert.acknowledged ? 'alert-success' : 'alert-danger'}">
+                <h5><i class="fas fa-exclamation-triangle"></i> \${alert.alert_type.toUpperCase()} ALERT</h5>
             </div>
             
             <div class="row">
@@ -2531,15 +3451,15 @@
                     <table class="table table-sm">
                         <tr>
                             <td><strong>Worker Name:</strong></td>
-                            <td>${alert.worker_name || 'Unknown'}</td>
+                            <td>\${alert.worker_name || 'Unknown'}</td>
                         </tr>
                         <tr>
                             <td><strong>Worker ID:</strong></td>
-                            <td>${alert.worker_id}</td>
+                            <td>\${alert.worker_id}</td>
                         </tr>
                         <tr>
                             <td><strong>Alert Time:</strong></td>
-                            <td>${time.toLocaleString()}</td>
+                            <td>\${time.toLocaleString()}</td>
                         </tr>
                     </table>
                 </div>
@@ -2549,15 +3469,15 @@
                         <tr>
                             <td><strong>Risk Score:</strong></td>
                             <td>
-                                <span class="badge ${alert.risk_score > 60 ? 'bg-danger' : alert.risk_score > 30 ? 'bg-warning' : 'bg-success'}">
-                                    ${alert.risk_score}
+                                <span class="badge \${alert.risk_score > 60 ? 'bg-danger' : alert.risk_score > 30 ? 'bg-warning' : 'bg-success'}">
+                                    \${alert.risk_score}
                                 </span>
                             </td>
                         </tr>
                         <tr>
                             <td><strong>Status:</strong></td>
                             <td>
-                                ${alert.acknowledged ? 
+                                \${alert.acknowledged ? 
                                     '<span class="badge bg-success">Acknowledged</span>' : 
                                     '<span class="badge bg-warning">Pending</span>'
                                 }
@@ -2565,7 +3485,7 @@
                         </tr>
                         <tr>
                             <td><strong>Duration:</strong></td>
-                            <td>${alert.time_ago}</td>
+                            <td>\${alert.time_ago}</td>
                         </tr>
                     </table>
                 </div>
@@ -2574,24 +3494,24 @@
             <div class="mt-3">
                 <h6>Alert Message</h6>
                 <div class="alert alert-light border">
-                    ${alert.message}
+                    \${alert.message}
                 </div>
             </div>
             
             {% if session.role == 'manager' %}
             <div class="mt-3">
                 <h6>Action Taken</h6>
-                ${alert.acknowledged ? 
-                    `<p class="text-success">
+                \${alert.acknowledged ? 
+                    \`<p class="text-success">
                         <i class="fas fa-check-circle"></i> 
-                        Acknowledged by ${alert.acknowledged_by} 
-                        at ${new Date(alert.acknowledged_at).toLocaleString()}
-                    </p>` : 
+                        Acknowledged by \${alert.acknowledged_by} 
+                        at \${new Date(alert.acknowledged_at).toLocaleString()}
+                    </p>\` : 
                     '<p class="text-muted">No action taken yet.</p>'
                 }
             </div>
             {% endif %}
-        `;
+        \`;
         
         document.getElementById('alertDetailContent').innerHTML = content;
         
@@ -2616,7 +3536,7 @@
 
     // Acknowledge alert
     function acknowledgeAlert(alertId) {
-        fetch(`/api/alerts/${alertId}/acknowledge`, {
+        fetch(\`/api/alerts/\${alertId}/acknowledge\`, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
@@ -2644,7 +3564,7 @@
         let completed = 0;
         
         pendingAlerts.forEach(alert => {
-            fetch(`/api/alerts/${alert.id}/acknowledge`, {
+            fetch(\`/api/alerts/\${alert.id}/acknowledge\`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
@@ -2654,7 +3574,7 @@
                 completed++;
                 if (completed === pendingAlerts.length) {
                     loadAlerts();
-                    showToast(`Acknowledged ${completed} alerts`, 'success');
+                    showToast(\`Acknowledged \${completed} alerts\`, 'success');
                 }
             });
         });
@@ -2767,12 +3687,12 @@
         if (!toastContainer) {
             toastContainer = document.createElement('div');
             toastContainer.id = 'toastContainer';
-            toastContainer.style.cssText = `
+            toastContainer.style.cssText = \`
                 position: fixed;
                 top: 20px;
                 right: 20px;
                 z-index: 9999;
-            `;
+            \`;
             document.body.appendChild(toastContainer);
         }
         
@@ -2780,15 +3700,15 @@
         const toastId = 'toast-' + Date.now();
         const toast = document.createElement('div');
         toast.id = toastId;
-        toast.className = `alert alert-${type} alert-dismissible fade show`;
-        toast.innerHTML = `
-            ${message}
-            <button type="button" class="btn-close" onclick="document.getElementById('${toastId}').remove()"></button>
-        `;
-        toast.style.cssText = `
+        toast.className = \`alert alert-\${type} alert-dismissible fade show\`;
+        toast.innerHTML = \`
+            \${message}
+            <button type="button" class="btn-close" onclick="document.getElementById('\${toastId}').remove()"></button>
+        \`;
+        toast.style.cssText = \`
             margin-bottom: 10px;
             min-width: 250px;
-        `;
+        \`;
         
         toastContainer.appendChild(toast);
         
@@ -2802,7 +3722,7 @@
 
     // Add CSS for alert rows
     const style = document.createElement('style');
-    style.textContent = `
+    style.textContent = \`
         .alert-row {
             animation: pulse 2s infinite;
         }
@@ -2814,377 +3734,44 @@
             50% { box-shadow: inset 0 0 0 10px rgba(231, 76, 60, 0); }
             100% { box-shadow: inset 0 0 0 0 rgba(231, 76, 60, 0.1); }
         }
-    `;
+    \`;
     document.head.appendChild(style);
 </script>
-{% endblock %}
-
-<!-- ============================ -->
-<!-- FILE: style.css -->
-<!-- ============================ -->
-/* Smart Safety Helmet - Main Styles */
-
-/* Base styles */
-:root {
-    --primary: #2c3e50;
-    --secondary: #3498db;
-    --danger: #e74c3c;
-    --warning: #f39c12;
-    --success: #2ecc71;
-    --info: #17a2b8;
-    --light: #ecf0f1;
-    --dark: #34495e;
-}
-
-body {
-    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-    min-height: 100vh;
-}
-
-/* Login page */
-.login-container {
-    background: rgba(255, 255, 255, 0.95);
-    border-radius: 20px;
-    padding: 40px;
-    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
-}
-
-.login-header {
-    text-align: center;
-    margin-bottom: 40px;
-}
-
-.login-header i {
-    font-size: 4em;
-    color: var(--primary);
-    margin-bottom: 20px;
-}
-
-/* Cards */
-.card {
-    border: none;
-    border-radius: 15px;
-    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.08);
-    transition: all 0.3s ease;
-    margin-bottom: 20px;
-}
-
-.card:hover {
-    transform: translateY(-5px);
-    box-shadow: 0 15px 40px rgba(0, 0, 0, 0.12);
-}
-
-.card-header {
-    border-radius: 15px 15px 0 0 !important;
-    font-weight: 600;
-    border: none;
-}
-
-/* Risk indicators */
-.risk-indicator {
-    padding: 8px 20px;
-    border-radius: 20px;
-    font-weight: bold;
-    font-size: 0.9em;
-    display: inline-block;
-}
-
-.risk-safe {
-    background: linear-gradient(135deg, #2ecc71 0%, #27ae60 100%);
-    color: white;
-}
-
-.risk-warning {
-    background: linear-gradient(135deg, #f39c12 0%, #d35400 100%);
-    color: white;
-}
-
-.risk-danger {
-    background: linear-gradient(135deg, #e74c3c 0%, #c0392b 100%);
-    color: white;
-    animation: pulse 2s infinite;
-}
-
-@keyframes pulse {
-    0% { box-shadow: 0 0 0 0 rgba(231, 76, 60, 0.7); }
-    70% { box-shadow: 0 0 0 10px rgba(231, 76, 60, 0); }
-    100% { box-shadow: 0 0 0 0 rgba(231, 76, 60, 0); }
-}
-
-/* Status badges */
-.status-badge {
-    padding: 5px 15px;
-    border-radius: 20px;
-    font-weight: 600;
-    font-size: 0.8em;
-}
-
-.status-active {
-    background: var(--success);
-    color: white;
-}
-
-.status-inactive {
-    background: #95a5a6;
-    color: white;
-}
-
-.status-alert {
-    background: var(--danger);
-    color: white;
-    animation: blink 1s infinite;
-}
-
-@keyframes blink {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.5; }
-}
-
-/* Progress bars */
-.progress {
-    height: 25px;
-    border-radius: 12px;
-    overflow: hidden;
-}
-
-.progress-bar {
-    border-radius: 12px;
-    font-weight: 600;
-    line-height: 25px;
-}
-
-/* Tables */
-.table {
-    --bs-table-bg: transparent;
-}
-
-.table th {
-    font-weight: 600;
-    color: var(--primary);
-    border-bottom-width: 2px;
-}
-
-.table-hover tbody tr:hover {
-    background-color: rgba(52, 152, 219, 0.1);
-}
-
-/* Buttons */
-.btn {
-    border-radius: 8px;
-    font-weight: 600;
-    padding: 10px 20px;
-    transition: all 0.3s ease;
-}
-
-.btn-primary {
-    background: linear-gradient(135deg, #3498db 0%, #2980b9 100%);
-    border: none;
-}
-
-.btn-danger {
-    background: linear-gradient(135deg, #e74c3c 0%, #c0392b 100%);
-    border: none;
-}
-
-.btn-warning {
-    background: linear-gradient(135deg, #f39c12 0%, #d35400 100%);
-    border: none;
-    color: white;
-}
-
-.btn-success {
-    background: linear-gradient(135deg, #2ecc71 0%, #27ae60 100%);
-    border: none;
-}
-
-.btn:hover {
-    transform: translateY(-2px);
-    box-shadow: 0 5px 15px rgba(0, 0, 0, 0.2);
-}
-
-/* Real-time indicator */
-.real-time-indicator {
-    width: 12px;
-    height: 12px;
-    border-radius: 50%;
-    display: inline-block;
-    margin-right: 5px;
-    animation: blink 1.5s infinite;
-}
-
-.real-time-online {
-    background: var(--success);
-}
-
-.real-time-offline {
-    background: #95a5a6;
-}
-
-/* Sensor values */
-.sensor-value {
-    font-size: 2.5em;
-    font-weight: 700;
-    margin: 10px 0;
-}
-
-.sensor-label {
-    color: #7f8c8d;
-    font-size: 0.9em;
-    text-transform: uppercase;
-    letter-spacing: 1px;
-}
-
-/* Alerts */
-.alert-card {
-    border-left: 5px solid var(--danger);
-    animation: slideIn 0.5s ease;
-}
-
-@keyframes slideIn {
-    from {
-        opacity: 0;
-        transform: translateX(-20px);
-    }
-    to {
-        opacity: 1;
-        transform: translateX(0);
-    }
-}
-
-/* Charts container */
-.chart-container {
-    position: relative;
-    height: 300px;
-    width: 100%;
-}
-
-/* Sidebar */
-.sidebar {
-    background: linear-gradient(180deg, var(--primary) 0%, #1a252f 100%);
-    min-height: 100vh;
-    color: white;
-    padding: 0;
-}
-
-.sidebar-brand {
-    padding: 20px;
-    text-align: center;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
-}
-
-.sidebar-nav {
-    padding: 20px 0;
-}
-
-.sidebar-nav a {
-    display: block;
-    padding: 12px 25px;
-    color: rgba(255, 255, 255, 0.8);
-    text-decoration: none;
-    transition: all 0.3s ease;
-    border-left: 3px solid transparent;
-}
-
-.sidebar-nav a:hover {
-    background: rgba(255, 255, 255, 0.1);
-    color: white;
-    border-left-color: var(--secondary);
-}
-
-.sidebar-nav a.active {
-    background: rgba(52, 152, 219, 0.2);
-    color: white;
-    border-left-color: var(--secondary);
-}
-
-.sidebar-nav i {
-    width: 25px;
-    margin-right: 10px;
-}
-
-/* Mobile responsive */
-@media (max-width: 768px) {
-    .login-container {
-        margin: 20px;
-        padding: 30px;
+{% endblock %}'''
     }
     
-    .card {
-        margin-bottom: 15px;
-    }
+    for filename, content in html_files.items():
+        with open(os.path.join(templates_dir, filename), 'w') as f:
+            f.write(content)
     
-    .sensor-value {
-        font-size: 2em;
-    }
+    print("Templates created successfully!")
+
+# Create requirements.txt
+requirements = '''Flask==2.3.3
+firebase-admin==6.2.0
+Werkzeug==2.3.7
+requests==2.31.0
+python-dotenv==1.0.0'''
+
+with open('requirements.txt', 'w') as f:
+    f.write(requirements)
+
+if __name__ == '__main__':
+    # Create templates and initialize data
+    create_templates()
+    initialize_default_data()
     
-    .sidebar {
-        min-height: auto;
-        margin-bottom: 20px;
-    }
-}
-
-/* Animations */
-.fade-in {
-    animation: fadeIn 0.5s ease;
-}
-
-@keyframes fadeIn {
-    from { opacity: 0; }
-    to { opacity: 1; }
-}
-
-/* Utility classes */
-.text-gradient {
-    background: linear-gradient(135deg, #3498db 0%, #9b59b6 100%);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    background-clip: text;
-}
-
-.glow {
-    box-shadow: 0 0 20px rgba(52, 152, 219, 0.5);
-}
-
-/* Dashboard grid */
-.dashboard-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-    gap: 20px;
-    margin-bottom: 30px;
-}
-
-/* Loading spinner */
-.loading-spinner {
-    border: 3px solid #f3f3f3;
-    border-top: 3px solid var(--secondary);
-    border-radius: 50%;
-    width: 40px;
-    height: 40px;
-    animation: spin 1s linear infinite;
-    margin: 20px auto;
-}
-
-@keyframes spin {
-    0% { transform: rotate(0deg); }
-    100% { transform: rotate(360deg); }
-}
-
-/* Custom scrollbar */
-::-webkit-scrollbar {
-    width: 8px;
-}
-
-::-webkit-scrollbar-track {
-    background: #f1f1f1;
-    border-radius: 4px;
-}
-
-::-webkit-scrollbar-thumb {
-    background: var(--secondary);
-    border-radius: 4px;
-}
-
-::-webkit-scrollbar-thumb:hover {
-    background: #2980b9;
-}
+    print("\n" + "="*50)
+    print("Smart Safety Helmet System")
+    print("="*50)
+    print("\nStarting server...")
+    print("Web Interface: http://localhost:5000")
+    print("\nDefault Login Credentials:")
+    print("  Manager: manager / manager123")
+    print("  Worker: worker001 / worker123")
+    print("\nWiFi Credentials for ESP32:")
+    print(f"  SSID: {Config.WIFI_SSID}")
+    print(f"  Password: {Config.WIFI_PASSWORD}")
+    print("\n" + "="*50)
+    
+    app.run(host='0.0.0.0', port=5000, debug=True)
